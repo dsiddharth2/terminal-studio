@@ -12,7 +12,7 @@ pub fn icon_button(
     ui: &mut egui::Ui,
     id: egui::Id,
     rect: egui::Rect,
-    icon: &str,
+    glyph: char,
     font_size: f32,
     fg: egui::Color32,
     style: IconButtonStyle,
@@ -69,77 +69,11 @@ pub fn icon_button(
     ui.painter().text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
-        icon,
-        egui::FontId::proportional(font_size),
+        glyph,
+        egui::FontId::new(font_size, egui::FontFamily::Name("icons".into())),
         text_color,
     );
 
-    resp
-}
-
-// ── Action button styles ───────────────────────────────────────────────────
-
-pub enum ActionButtonStyle {
-    Primary,
-    Danger,
-    Cancel,
-}
-
-pub fn action_button(
-    ui: &mut egui::Ui,
-    label: &str,
-    enabled: bool,
-    style: ActionButtonStyle,
-) -> egui::Response {
-    let t = theme::active();
-    let btn = match style {
-        ActionButtonStyle::Primary => {
-            egui::Button::new(egui::RichText::new(label).color(t.accent_strong))
-                .fill(egui::Color32::from_rgba_unmultiplied(
-                    t.accent.r(),
-                    t.accent.g(),
-                    t.accent.b(),
-                    theme::ALPHA_BTN_FILL,
-                ))
-                .stroke(egui::Stroke::new(
-                    theme::STROKE_THIN,
-                    egui::Color32::from_rgba_unmultiplied(
-                        t.accent.r(),
-                        t.accent.g(),
-                        t.accent.b(),
-                        theme::ALPHA_BTN_STROKE,
-                    ),
-                ))
-                .rounding(theme::R_MD)
-        }
-        ActionButtonStyle::Danger => egui::Button::new(egui::RichText::new(label).color(t.error))
-            .fill(egui::Color32::from_rgba_unmultiplied(
-                t.error.r(),
-                t.error.g(),
-                t.error.b(),
-                theme::ALPHA_BTN_FILL,
-            ))
-            .stroke(egui::Stroke::new(
-                theme::STROKE_THIN,
-                egui::Color32::from_rgba_unmultiplied(
-                    t.error.r(),
-                    t.error.g(),
-                    t.error.b(),
-                    theme::ALPHA_BTN_STROKE,
-                ),
-            ))
-            .rounding(theme::R_MD),
-        ActionButtonStyle::Cancel => {
-            egui::Button::new(egui::RichText::new(label).color(t.fg_muted))
-                .fill(egui::Color32::TRANSPARENT)
-                .stroke(egui::Stroke::new(theme::STROKE_THIN, t.border_subtle))
-                .rounding(theme::R_MD)
-        }
-    };
-    let resp = ui.add_enabled(enabled, btn);
-    if resp.hovered() && enabled {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
     resp
 }
 
@@ -149,7 +83,7 @@ pub fn toggle_chip(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Resp
     let t = theme::active();
     let btn = egui::Button::new(
         egui::RichText::new(label)
-            .size(theme::FONT_UI_MD)
+            .size(theme::FONT_SM)
             .color(if selected { t.base } else { t.text }),
     )
     .fill(if selected { t.accent } else { t.surface1 })
@@ -180,11 +114,11 @@ pub fn pill_button(ui: &mut egui::Ui, label: &str, rect: egui::Rect) -> egui::Re
     } else {
         theme::tinted(t.blue_rgb, theme::BLEND_SUBTLE)
     };
-    let bg = egui::Color32::from_rgb(tint[0], tint[1], tint[2]);
+    let bg = theme::from_rgb(tint);
     let p = ui.painter();
     p.rect_filled(rect, theme::R_SM, bg);
 
-    let pill_font = egui::FontId::monospace(theme::FONT_UI_XS);
+    let pill_font = egui::FontId::proportional(theme::FONT_XS);
     let text_galley = p.layout_no_wrap(label.to_string(), pill_font, t.accent);
     p.galley(
         egui::pos2(

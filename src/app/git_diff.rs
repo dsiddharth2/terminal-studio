@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use super::diff_parser::{DiffLineKind, DiffViewMode};
-use crate::git::parser::{parse_git_status, FileChangeKind};
+use crate::git::parser::FileChangeKind;
 use crate::theme;
 
 pub(super) enum GitStageAction {
@@ -52,7 +52,7 @@ fn kind_to_color(kind: FileChangeKind) -> egui::Color32 {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn render_git_diff(
     ui: &mut egui::Ui,
-    status: &str,
+    status: &super::git_worker::GitStatusSnapshot,
     unpushed: &[(String, String)],
     push_in_progress: bool,
     push_error: Option<&str>,
@@ -88,14 +88,15 @@ pub(super) fn render_git_diff(
                 ui.add(egui::Spinner::new().size(14.0));
                 ui.label(
                     egui::RichText::new("Refreshing\u{2026}")
-                        .size(theme::FONT_UI_SM)
+                        .size(theme::FONT_XS)
                         .color(t.subtext0),
                 );
             } else {
                 let btn = ui.add(
                     egui::Button::new(
-                        egui::RichText::new("\u{21BB}")
-                            .size(theme::FONT_UI_MD)
+                        egui::RichText::new("↻")
+                            .family(egui::FontFamily::Proportional)
+                            .size(theme::FONT_SM)
                             .color(t.text),
                     )
                     .frame(false),
@@ -108,18 +109,11 @@ pub(super) fn render_git_diff(
         });
     });
 
-    let has_status = !status.is_empty() || !optimistic_overrides.is_empty();
-    let mut parsed = if !status.is_empty() {
-        parse_git_status(status)
-    } else {
-        Vec::new()
-    };
-    for fs in &mut parsed {
-        if let Some(&target_staged) = optimistic_overrides.get(&fs.path) {
-            fs.staged = target_staged;
-        }
-    }
-    let has_conflicts = parsed.iter().any(|f| f.kind == FileChangeKind::Conflicted);
+    let has_status = !status.entries.is_empty() || !optimistic_overrides.is_empty();
+    let has_conflicts = status
+        .entries
+        .iter()
+        .any(|f| f.kind == FileChangeKind::Conflicted);
 
     // ── Merge/rebase/cherry-pick status banner ─────────────────────────
     if *merge_operation != super::git_worker::MergeOperation::None {
@@ -157,7 +151,7 @@ pub(super) fn render_git_diff(
                     };
                     ui.label(
                         egui::RichText::new(format!("{icon} {label}"))
-                            .size(theme::FONT_UI_MD)
+                            .size(theme::FONT_SM)
                             .color(t.warning),
                     );
 
@@ -166,7 +160,7 @@ pub(super) fn render_git_diff(
                         let abort_btn = ui.add(
                             egui::Button::new(
                                 egui::RichText::new("Abort")
-                                    .size(theme::FONT_UI_SM)
+                                    .size(theme::FONT_XS)
                                     .color(t.text),
                             )
                             .fill(t.error)
@@ -180,7 +174,7 @@ pub(super) fn render_git_diff(
                             !has_conflicts,
                             egui::Button::new(
                                 egui::RichText::new("Continue")
-                                    .size(theme::FONT_UI_SM)
+                                    .size(theme::FONT_XS)
                                     .color(if has_conflicts { t.overlay0 } else { t.text }),
                             )
                             .fill(if has_conflicts { t.surface1 } else { t.success })
@@ -211,7 +205,7 @@ pub(super) fn render_git_diff(
         let mut unstaged: Vec<StatusEntry> = Vec::new();
         let mut conflicted: Vec<StatusEntry> = Vec::new();
 
-        for fs in &parsed {
+        for fs in &status.entries {
             if fs.kind == FileChangeKind::Conflicted {
                 conflicted.push(StatusEntry {
                     tag: kind_to_tag(fs.kind),
@@ -227,7 +221,11 @@ pub(super) fn render_git_diff(
                 color: kind_to_color(fs.kind),
                 kind: fs.kind,
             };
-            if fs.staged {
+            let is_staged = optimistic_overrides
+                .get(&fs.path)
+                .copied()
+                .unwrap_or(fs.staged);
+            if is_staged {
                 staged.push(entry);
             } else {
                 unstaged.push(entry);
@@ -241,7 +239,7 @@ pub(super) fn render_git_diff(
                 ui.label(
                     egui::RichText::new(format!("Conflicts ({})", conflicted.len()))
                         .strong()
-                        .size(theme::FONT_UI_MD)
+                        .size(theme::FONT_SM)
                         .color(t.warning),
                 );
             });
@@ -260,7 +258,7 @@ pub(super) fn render_git_diff(
                         badge_rect.center(),
                         egui::Align2::CENTER_CENTER,
                         entry.tag,
-                        egui::FontId::monospace(theme::GIT_FONT_SZ),
+                        egui::FontId::proportional(theme::FONT_XS),
                         badge_fg,
                     );
                     let label_max = (ui.available_width()).max(20.0);
@@ -269,8 +267,8 @@ pub(super) fn render_git_diff(
                             ui.add(
                                 egui::Label::new(
                                     egui::RichText::new(&entry.path)
-                                        .monospace()
-                                        .size(theme::FONT_UI_MD),
+                                        .family(egui::FontFamily::Proportional)
+                                        .size(theme::FONT_SM),
                                 )
                                 .truncate()
                                 .sense(egui::Sense::click()),
@@ -302,7 +300,7 @@ pub(super) fn render_git_diff(
                 ui.label(
                     egui::RichText::new(header_text)
                         .strong()
-                        .size(theme::FONT_UI_MD)
+                        .size(theme::FONT_SM)
                         .color(t.blue),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -311,14 +309,14 @@ pub(super) fn render_git_diff(
                         ui.add(egui::Spinner::new().size(14.0));
                         ui.label(
                             egui::RichText::new("Pushing\u{2026}")
-                                .size(theme::FONT_UI_SM)
+                                .size(theme::FONT_XS)
                                 .color(t.subtext0),
                         );
                     } else if ui
                         .add(
                             egui::Button::new(
                                 egui::RichText::new("Push")
-                                    .size(theme::FONT_UI_SM)
+                                    .size(theme::FONT_XS)
                                     .color(t.accent_strong),
                             )
                             .rounding(theme::R_SM),
@@ -337,14 +335,12 @@ pub(super) fn render_git_diff(
                     ui.label(
                         egui::RichText::new(hash)
                             .monospace()
-                            .size(theme::FONT_UI_SM)
+                            .size(theme::FONT_XS)
                             .color(t.yellow),
                     );
                     ui.add(
                         egui::Label::new(
-                            egui::RichText::new(msg)
-                                .size(theme::FONT_UI_SM)
-                                .color(t.text),
+                            egui::RichText::new(msg).size(theme::FONT_XS).color(t.text),
                         )
                         .truncate(),
                     );
@@ -367,7 +363,7 @@ pub(super) fn render_git_diff(
                     ui.label(
                         egui::RichText::new("Push failed")
                             .strong()
-                            .size(theme::FONT_UI_SM)
+                            .size(theme::FONT_XS)
                             .color(t.error),
                     );
                     let lines: Vec<&str> = err.lines().take(5).collect();
@@ -375,7 +371,7 @@ pub(super) fn render_git_diff(
                     ui.label(
                         egui::RichText::new(display)
                             .monospace()
-                            .size(theme::FONT_UI_XS)
+                            .size(theme::FONT_XS)
                             .color(t.text),
                     );
                 });
@@ -388,19 +384,18 @@ pub(super) fn render_git_diff(
                 ui.label(
                     egui::RichText::new(format!("Staged ({})", staged.len()))
                         .strong()
-                        .size(theme::FONT_UI_MD)
+                        .size(theme::FONT_SM)
                         .color(theme::active().git_added),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(theme::SP_4);
                     if ui
                         .add(
-                            egui::Button::new(
-                                egui::RichText::new("\u{2212}")
-                                    .monospace()
-                                    .size(theme::FONT_TERM)
-                                    .color(theme::active().git_removed),
-                            )
+                            egui::Button::new(crate::ui_kit::icon(
+                                crate::ui_kit::icon::X,
+                                theme::FONT_SM,
+                                theme::active().git_removed,
+                            ))
                             .frame(false),
                         )
                         .on_hover_text("Unstage All")
@@ -413,7 +408,7 @@ pub(super) fn render_git_diff(
                         .add(
                             egui::Button::new(
                                 egui::RichText::new("Commit")
-                                    .size(theme::FONT_UI_SM)
+                                    .size(theme::FONT_XS)
                                     .color(t.accent_strong),
                             )
                             .rounding(theme::R_SM),
@@ -440,7 +435,7 @@ pub(super) fn render_git_diff(
                         badge_rect.center(),
                         egui::Align2::CENTER_CENTER,
                         entry.tag,
-                        egui::FontId::monospace(theme::GIT_FONT_SZ),
+                        egui::FontId::proportional(theme::FONT_XS),
                         badge_fg,
                     );
                     let btn_reserve = theme::SP_4 + 20.0;
@@ -450,8 +445,8 @@ pub(super) fn render_git_diff(
                             ui.add(
                                 egui::Label::new(
                                     egui::RichText::new(&entry.path)
-                                        .monospace()
-                                        .size(theme::FONT_UI_MD),
+                                        .family(egui::FontFamily::Proportional)
+                                        .size(theme::FONT_SM),
                                 )
                                 .truncate()
                                 .sense(egui::Sense::click_and_drag()),
@@ -494,12 +489,11 @@ pub(super) fn render_git_diff(
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(theme::SP_4);
                         let btn = ui.add(
-                            egui::Button::new(
-                                egui::RichText::new("\u{2212}")
-                                    .monospace()
-                                    .size(theme::FONT_TERM)
-                                    .color(theme::active().git_removed),
-                            )
+                            egui::Button::new(crate::ui_kit::icon(
+                                crate::ui_kit::icon::X,
+                                theme::FONT_SM,
+                                theme::active().git_removed,
+                            ))
                             .frame(false),
                         );
                         if btn.on_hover_text("Unstage").clicked() {
@@ -524,7 +518,7 @@ pub(super) fn render_git_diff(
                 ui.label(
                     egui::RichText::new(format!("Changes ({})", unstaged.len()))
                         .strong()
-                        .size(theme::FONT_UI_MD),
+                        .size(theme::FONT_SM),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(theme::SP_4);
@@ -560,7 +554,7 @@ pub(super) fn render_git_diff(
                         badge_rect.center(),
                         egui::Align2::CENTER_CENTER,
                         entry.tag,
-                        egui::FontId::monospace(theme::GIT_FONT_SZ),
+                        egui::FontId::proportional(theme::FONT_XS),
                         badge_fg,
                     );
                     let can_revert = entry.kind != FileChangeKind::Untracked;
@@ -571,8 +565,8 @@ pub(super) fn render_git_diff(
                             ui.add(
                                 egui::Label::new(
                                     egui::RichText::new(&entry.path)
-                                        .monospace()
-                                        .size(theme::FONT_UI_MD),
+                                        .family(egui::FontFamily::Proportional)
+                                        .size(theme::FONT_SM),
                                 )
                                 .truncate()
                                 .sense(egui::Sense::click_and_drag()),
@@ -628,12 +622,11 @@ pub(super) fn render_git_diff(
                         }
                         if can_revert {
                             let revert_btn = ui.add(
-                                egui::Button::new(
-                                    egui::RichText::new("\u{21BA}")
-                                        .monospace()
-                                        .size(theme::FONT_TERM)
-                                        .color(theme::active().error),
-                                )
+                                egui::Button::new(crate::ui_kit::icon(
+                                    crate::ui_kit::icon::REFRESH_CW,
+                                    theme::FONT_SM,
+                                    theme::active().error,
+                                ))
                                 .frame(false),
                             );
                             if revert_btn.on_hover_text("Revert changes").clicked() {
@@ -641,12 +634,11 @@ pub(super) fn render_git_diff(
                             }
                         } else {
                             let del_btn = ui.add(
-                                egui::Button::new(
-                                    egui::RichText::new("\u{2715}")
-                                        .monospace()
-                                        .size(theme::FONT_TERM)
-                                        .color(theme::active().error),
-                                )
+                                egui::Button::new(crate::ui_kit::icon(
+                                    crate::ui_kit::icon::TRASH,
+                                    theme::FONT_SM,
+                                    theme::active().error,
+                                ))
                                 .frame(false),
                             );
                             if del_btn.on_hover_text("Delete file").clicked() {
@@ -664,18 +656,19 @@ pub(super) fn render_git_diff(
         }
     }
 
-    if status.is_empty() && unpushed.is_empty() && !push_in_progress && push_error.is_none() {
+    if status.entries.is_empty() && unpushed.is_empty() && !push_in_progress && push_error.is_none()
+    {
         ui.add_space(theme::SP_4);
         ui.vertical_centered(|ui| {
             ui.label(
                 egui::RichText::new("No changes")
                     .italics()
                     .color(theme::active().overlay0)
-                    .size(theme::FONT_UI_LG),
+                    .size(theme::FONT_MD),
             );
             ui.label(
                 egui::RichText::new("Working tree is clean")
-                    .size(theme::FONT_UI_SM)
+                    .size(theme::FONT_XS)
                     .color(theme::active().overlay0),
             );
         });
@@ -806,13 +799,9 @@ pub(super) fn render_diff_toolbar(
                 (t.surface1, t.subtext0)
             };
             let btn = ui.add(
-                egui::Button::new(
-                    egui::RichText::new(*label)
-                        .size(theme::FONT_UI_SM)
-                        .color(fg),
-                )
-                .fill(bg)
-                .rounding(theme::R_SM),
+                egui::Button::new(egui::RichText::new(*label).size(theme::FONT_XS).color(fg))
+                    .fill(bg)
+                    .rounding(theme::R_SM),
             );
             if btn.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -832,11 +821,11 @@ pub(super) fn render_diff_toolbar(
 
             let prev_btn = ui.add_enabled(
                 has_prev,
-                egui::Button::new(
-                    egui::RichText::new("\u{2191}")
-                        .size(theme::FONT_UI_MD)
-                        .color(if has_prev { t.text } else { t.overlay0 }),
-                )
+                egui::Button::new(crate::ui_kit::icon(
+                    crate::ui_kit::icon::CHEVRON_UP,
+                    theme::FONT_SM,
+                    if has_prev { t.text } else { t.overlay0 },
+                ))
                 .frame(false),
             );
             if prev_btn.hovered() && has_prev {
@@ -848,17 +837,17 @@ pub(super) fn render_diff_toolbar(
 
             ui.label(
                 egui::RichText::new(format!("{}/{}", current_hunk + 1, hunk_count))
-                    .size(theme::FONT_UI_SM)
+                    .size(theme::FONT_XS)
                     .color(t.subtext0),
             );
 
             let next_btn = ui.add_enabled(
                 has_next,
-                egui::Button::new(
-                    egui::RichText::new("\u{2193}")
-                        .size(theme::FONT_UI_MD)
-                        .color(if has_next { t.text } else { t.overlay0 }),
-                )
+                egui::Button::new(crate::ui_kit::icon(
+                    crate::ui_kit::icon::CHEVRON_DOWN,
+                    theme::FONT_SM,
+                    if has_next { t.text } else { t.overlay0 },
+                ))
                 .frame(false),
             );
             if next_btn.hovered() && has_next {
@@ -954,6 +943,40 @@ fn compute_hunk_start_indices(
     starts
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct DiffRowLayout {
+    /// Screen-space top of display row 0, including rows skipped by virtualization.
+    pub first_row_top: f32,
+    pub line_h: f32,
+    /// `line_h` plus the vertical item spacing used between rows.
+    pub row_pitch: f32,
+}
+
+fn diff_text_font() -> egui::FontId {
+    egui::FontId::proportional(theme::FONT_XS)
+}
+
+fn diff_line_height(ui: &egui::Ui, font: &egui::FontId) -> f32 {
+    ui.fonts(|fonts| fonts.row_height(font))
+}
+
+fn diff_row_pitch(ui: &egui::Ui, line_h: f32) -> f32 {
+    line_h + ui.spacing().item_spacing.y
+}
+
+fn diff_row_layout(ui: &egui::Ui, first_row_top: f32) -> (egui::FontId, DiffRowLayout) {
+    let font = diff_text_font();
+    let line_h = diff_line_height(ui, &font);
+    (
+        font,
+        DiffRowLayout {
+            first_row_top,
+            line_h,
+            row_pitch: diff_row_pitch(ui, line_h),
+        },
+    )
+}
+
 pub(super) fn render_inline_diff_full(
     ui: &mut egui::Ui,
     old_content: &str,
@@ -962,24 +985,23 @@ pub(super) fn render_inline_diff_full(
     old_highlights: Option<&[Vec<(egui::Color32, String)>]>,
     new_highlights: Option<&[Vec<(egui::Color32, String)>]>,
     scroll_to_hunk: Option<usize>,
-) {
+) -> DiffRowLayout {
     use super::diff_parser::build_full_diff_lines;
 
     let lines = build_full_diff_lines(old_content, new_content, hunks);
     let t = theme::active();
     let gutter_w = 36.0_f32;
     let indicator_w = 16.0_f32;
-    let font_mono = egui::FontId::monospace(theme::FONT_UI_SM);
-    let gutter_font = egui::FontId::monospace(theme::FONT_UI_XS);
-    let line_h = ui.text_style_height(&egui::TextStyle::Monospace);
+    let content_top = ui.cursor().top();
+    let (font_mono, rows) = diff_row_layout(ui, content_top);
+    let gutter_font = font_mono.clone();
+    let line_h = rows.line_h;
 
     let hunk_starts = compute_hunk_start_indices(&lines, hunks);
     let scroll_target_line = scroll_to_hunk.and_then(|idx| hunk_starts.get(idx).copied());
 
     let line_count = lines.len();
-    let spacing = ui.spacing().item_spacing.y;
-    let row_h = line_h + spacing;
-    let content_top = ui.cursor().top();
+    let row_h = rows.row_pitch;
     let clip = ui.clip_rect();
     let buffer = 5_usize;
     let first_visible = ((clip.min.y - content_top) / row_h).floor().max(0.0) as usize;
@@ -1080,6 +1102,7 @@ pub(super) fn render_inline_diff_full(
             egui::Rect::from_min_size(egui::pos2(0.0, target_y), egui::vec2(1.0, row_h));
         ui.scroll_to_rect(target_rect, Some(egui::Align::Center));
     }
+    rows
 }
 
 fn compute_sbs_hunk_start_indices(
@@ -1118,7 +1141,7 @@ pub(super) fn render_side_by_side_diff(
     old_highlights: Option<&[Vec<(egui::Color32, String)>]>,
     new_highlights: Option<&[Vec<(egui::Color32, String)>]>,
     scroll_to_hunk: Option<usize>,
-) {
+) -> DiffRowLayout {
     use super::diff_parser::{build_full_diff_lines, build_side_by_side_lines};
 
     let full = build_full_diff_lines(old_content, new_content, hunks);
@@ -1129,9 +1152,9 @@ pub(super) fn render_side_by_side_diff(
     let half_w = (total_w / 2.0 - 1.0).max(100.0);
     let gutter_w = 36.0_f32;
     let indicator_w = 16.0_f32;
-    let font_mono = egui::FontId::monospace(theme::FONT_UI_SM);
-    let gutter_font = egui::FontId::monospace(theme::FONT_UI_XS);
-    let line_h = ui.text_style_height(&egui::TextStyle::Monospace);
+    let font_mono = diff_text_font();
+    let gutter_font = font_mono.clone();
+    let line_h = diff_line_height(ui, &font_mono);
 
     ui.horizontal(|ui| {
         let (left_header, _) =
@@ -1140,7 +1163,7 @@ pub(super) fn render_side_by_side_diff(
             egui::pos2(left_header.min.x + theme::SP_2, left_header.center().y),
             egui::Align2::LEFT_CENTER,
             "HEAD",
-            egui::FontId::proportional(theme::FONT_UI_SM),
+            egui::FontId::proportional(theme::FONT_XS),
             t.subtext0,
         );
         let (sep_rect, _) =
@@ -1152,7 +1175,7 @@ pub(super) fn render_side_by_side_diff(
             egui::pos2(right_header.min.x + theme::SP_2, right_header.center().y),
             egui::Align2::LEFT_CENTER,
             "Working Tree",
-            egui::FontId::proportional(theme::FONT_UI_SM),
+            egui::FontId::proportional(theme::FONT_XS),
             t.subtext0,
         );
     });
@@ -1171,9 +1194,13 @@ pub(super) fn render_side_by_side_diff(
     let scroll_target_line = scroll_to_hunk.and_then(|idx| sbs_hunk_starts.get(idx).copied());
 
     let line_count = left_lines.len();
-    let spacing = ui.spacing().item_spacing.y;
-    let row_h = line_h + spacing;
     let content_top = ui.cursor().top();
+    let rows = DiffRowLayout {
+        first_row_top: content_top,
+        line_h,
+        row_pitch: diff_row_pitch(ui, line_h),
+    };
+    let row_h = rows.row_pitch;
     let clip = ui.clip_rect();
     let buffer = 5_usize;
     let first_visible = ((clip.min.y - content_top) / row_h).floor().max(0.0) as usize;
@@ -1218,6 +1245,7 @@ pub(super) fn render_side_by_side_diff(
             egui::Rect::from_min_size(egui::pos2(0.0, target_y), egui::vec2(1.0, row_h));
         ui.scroll_to_rect(target_rect, Some(egui::Align::Center));
     }
+    rows
 }
 
 struct SbsLayout<'a> {

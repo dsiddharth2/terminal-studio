@@ -63,107 +63,7 @@ impl App {
             }
         }
 
-        {
-            use egui::{Rounding, Shadow, Stroke, Visuals};
-            let t = theme::active();
-            let mut vis = if t.is_light {
-                Visuals::light()
-            } else {
-                Visuals::dark()
-            };
-            vis.panel_fill = t.bg_panel_fill;
-            vis.window_fill = t.bg_term;
-            vis.window_rounding = Rounding::same(theme::R_LG);
-            vis.window_shadow = Shadow::NONE;
-            vis.popup_shadow = Shadow::NONE;
-            vis.widgets.noninteractive.bg_fill = t.surface0;
-            vis.widgets.inactive.bg_fill = t.surface0;
-            vis.widgets.hovered.bg_fill = t.surface1;
-            vis.widgets.active.bg_fill = t.surface2;
-            vis.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, t.subtext0);
-            vis.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, t.overlay0);
-            vis.selection.bg_fill = t.selection_bg;
-            for state in [
-                &mut vis.widgets.noninteractive,
-                &mut vis.widgets.inactive,
-                &mut vis.widgets.hovered,
-                &mut vis.widgets.active,
-                &mut vis.widgets.open,
-            ] {
-                state.rounding = Rounding::same(theme::R_MD);
-            }
-            vis.override_text_color = Some(t.text);
-            cc.egui_ctx.set_visuals(vis);
-
-            let mut style = (*cc.egui_ctx.style()).clone();
-            style.spacing.scroll = theme::scroll_style();
-            style.always_scroll_the_only_direction = true;
-            cc.egui_ctx.set_style(style);
-        }
-
-        {
-            use egui::{FontData, FontDefinitions, FontFamily};
-            let mut fonts = FontDefinitions::default();
-            let mut loaded = false;
-
-            #[cfg(target_os = "windows")]
-            {
-                let win_root =
-                    std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
-                let font_path = std::path::PathBuf::from(&win_root)
-                    .join("Fonts")
-                    .join("seguisym.ttf");
-                if let Ok(data) = std::fs::read(&font_path) {
-                    fonts
-                        .font_data
-                        .insert("symbol_fallback".to_owned(), FontData::from_owned(data));
-                    loaded = true;
-                }
-            }
-
-            #[cfg(target_os = "linux")]
-            {
-                let candidates = [
-                    "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf",
-                    "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf",
-                    "/usr/share/fonts/google-noto/NotoSansSymbols2-Regular.ttf",
-                    "/usr/share/fonts/TTF/NotoSansSymbols2-Regular.ttf",
-                    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-                    "/usr/share/fonts/dejavu/DejaVuSans.ttf",
-                ];
-                for path in candidates {
-                    if let Ok(data) = std::fs::read(path) {
-                        fonts
-                            .font_data
-                            .insert("symbol_fallback".to_owned(), FontData::from_owned(data));
-                        loaded = true;
-                        break;
-                    }
-                }
-            }
-
-            #[cfg(target_os = "macos")]
-            {
-                let path = "/System/Library/Fonts/Apple Symbols.ttf";
-                if let Ok(data) = std::fs::read(path) {
-                    fonts
-                        .font_data
-                        .insert("symbol_fallback".to_owned(), FontData::from_owned(data));
-                    loaded = true;
-                }
-            }
-
-            if loaded {
-                for family in [&FontFamily::Proportional, &FontFamily::Monospace] {
-                    fonts
-                        .families
-                        .entry(family.clone())
-                        .or_default()
-                        .push("symbol_fallback".to_owned());
-                }
-                cc.egui_ctx.set_fonts(fonts);
-            }
-        }
+        crate::fonts::install_fonts(&cc.egui_ctx);
 
         let mgr = SessionManager::new(ctx.clone());
         let loaded_settings = AppSettings::load();
@@ -189,6 +89,9 @@ impl App {
             workspace_panel_collapsed: false,
             workspace_search_query: String::new(),
             note_store,
+            note_autosave: super::note_save_worker::NoteAutosaveState::new(
+                super::note_save_worker::NOTE_SAVE_DELAY,
+            ),
             label_registry: LabelRegistry::load(),
             notes_panel_ratio: 0.35,
             notes_panel_collapsed: false,
@@ -217,6 +120,7 @@ impl App {
             closed_sessions_cache: None,
             shortcut_registry: ShortcutRegistry::new(),
             settings: loaded_settings,
+            applied_theme: None,
             active_term_geo: None,
             last_focused_sid: None,
             active_term_ui_id: None,
@@ -225,6 +129,7 @@ impl App {
             workers: super::worker_manager::WorkerManager {
                 foreground_worker: ForegroundWorker::spawn(),
                 git_worker: super::git_worker::GitWorker::spawn(ctx.clone()),
+                note_save_worker: super::note_save_worker::NoteSaveWorker::spawn(ctx.clone()),
                 workspace_git_worker: super::workspace_git_worker::WorkspaceGitWorker::spawn(
                     ctx.clone(),
                 ),
@@ -330,6 +235,7 @@ impl App {
             spawn_rate_limit_strikes: 0,
             spawn_circuit_broken: false,
             restart_attempted: false,
+            perf: super::perf::PerfMonitor::from_env(),
         };
 
         let (init_cols, init_rows) = {
@@ -341,6 +247,10 @@ impl App {
             let rows = ((est_h / CELL_H) as u16).max(24);
             (cols, rows)
         };
+
+        // Settings load (above) selects the saved theme. Apply visuals after that
+        // so a non-default theme is not left on the default palette.
+        app.apply_theme_visuals(&cc.egui_ctx);
 
         app.load_windows();
 
@@ -1965,42 +1875,17 @@ impl App {
         }
     }
 
-    pub(super) fn apply_theme_visuals(&self, ctx: &egui::Context) {
-        use egui::{Rounding, Shadow, Stroke, Visuals};
-        let t = theme::active();
-        let mut vis = if t.is_light {
-            Visuals::light()
-        } else {
-            Visuals::dark()
-        };
-        vis.panel_fill = t.bg_panel_fill;
-        vis.window_fill = t.bg_term;
-        vis.window_rounding = Rounding::same(theme::R_LG);
-        vis.window_shadow = Shadow::NONE;
-        vis.popup_shadow = Shadow::NONE;
-        vis.widgets.noninteractive.bg_fill = t.surface0;
-        vis.widgets.inactive.bg_fill = t.surface0;
-        vis.widgets.hovered.bg_fill = t.surface1;
-        vis.widgets.active.bg_fill = t.surface2;
-        vis.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, t.subtext0);
-        vis.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, t.overlay0);
-        vis.selection.bg_fill = t.selection_bg;
-        for state in [
-            &mut vis.widgets.noninteractive,
-            &mut vis.widgets.inactive,
-            &mut vis.widgets.hovered,
-            &mut vis.widgets.active,
-            &mut vis.widgets.open,
-        ] {
-            state.rounding = Rounding::same(theme::R_MD);
+    pub(super) fn apply_theme_visuals(&mut self, ctx: &egui::Context) {
+        let current = theme::current_id();
+        if self.applied_theme == Some(current) {
+            return;
         }
-        vis.override_text_color = Some(t.text);
-        ctx.set_visuals(vis);
-
+        ctx.set_visuals(theme::visuals_for(theme::active()));
         let mut style = (*ctx.style()).clone();
         style.spacing.scroll = theme::scroll_style();
         style.always_scroll_the_only_direction = true;
         ctx.set_style(style);
+        self.applied_theme = Some(current);
     }
 
     pub(super) fn extract_selected_text(&self, session_idx: usize) -> String {
@@ -2050,86 +1935,6 @@ impl App {
             }
         }
         result
-    }
-
-    pub(super) fn paint_sys_monitor(
-        &self,
-        painter: &egui::Painter,
-        rect: egui::Rect,
-        fg: egui::Color32,
-    ) {
-        let stats = self
-            .workers
-            .sys_monitor
-            .as_ref()
-            .map(|m| m.stats())
-            .unwrap_or_default();
-        let bar_h = 5.0_f32;
-        let bar_w = rect.width() - 8.0;
-        let x0 = rect.min.x + 4.0;
-
-        let font = egui::FontId::monospace(theme::FONT_SYS_SM);
-        let t = theme::active();
-
-        struct Row<'a> {
-            label: &'a str,
-            pct: f32,
-            color: egui::Color32,
-        }
-        let rows = [
-            Row {
-                label: "C",
-                pct: stats.cpu_percent,
-                color: t.blue,
-            },
-            Row {
-                label: "M",
-                pct: stats.ram_percent,
-                color: t.green,
-            },
-        ];
-
-        let row_h = 11.0_f32;
-        let y_start = rect.min.y + (rect.height() - row_h * rows.len() as f32 - 10.0) / 2.0;
-
-        for (i, row) in rows.iter().enumerate() {
-            let y = y_start + i as f32 * row_h;
-
-            let pct_label = format!("{} {:2.0}%", row.label, row.pct);
-            painter.text(
-                egui::pos2(x0, y + row_h * 0.5),
-                egui::Align2::LEFT_CENTER,
-                &pct_label,
-                font.clone(),
-                fg,
-            );
-
-            let track_x = x0 + 32.0;
-            let track = egui::Rect::from_min_size(
-                egui::pos2(track_x, y + (row_h - bar_h) / 2.0),
-                egui::vec2(bar_w - 32.0, bar_h),
-            );
-            painter.rect_filled(track, theme::R_SM, t.surface2);
-
-            let fill_w = (track.width() * (row.pct / 100.0).clamp(0.0, 1.0)).max(0.0);
-            if fill_w > 0.5 {
-                let fill = egui::Rect::from_min_size(track.min, egui::vec2(fill_w, bar_h));
-                painter.rect_filled(fill, theme::R_SM, row.color);
-            }
-        }
-
-        let net_text = format!(
-            "↓{} ↑{}",
-            crate::sys_monitor::format_bytes_rate(stats.net_rx_per_sec),
-            crate::sys_monitor::format_bytes_rate(stats.net_tx_per_sec),
-        );
-        painter.text(
-            egui::pos2(rect.center().x, rect.max.y - 2.0),
-            egui::Align2::CENTER_BOTTOM,
-            &net_text,
-            egui::FontId::monospace(theme::FONT_SYS_XS),
-            fg.linear_multiply(0.7),
-        );
     }
 
     // ── Drag-and-drop action execution ──────────────────────────────────

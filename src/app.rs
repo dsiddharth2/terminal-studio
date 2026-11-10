@@ -4,8 +4,6 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use egui::FontId;
-
 use crate::editor_group::NavigationDir;
 use crate::pane_tree::{PaneNode, RemoveResult, SplitDir};
 use crate::pty::{default_shell, SessionManager, ShellKind};
@@ -34,8 +32,10 @@ mod input;
 mod labels;
 mod markdown;
 mod multi_window;
+mod note_save_worker;
 mod pane;
 mod pane_state;
+pub(crate) mod perf;
 mod persistence;
 pub(crate) mod scrollback_capture;
 pub(crate) mod scrollback_inject;
@@ -51,7 +51,9 @@ mod workspace_ui;
 
 // ── Re-imports from submodules ───────────────────────────────────────────────
 
-use file_browser::{render_dir_tree, render_flat_file_list, FileEntry, RevealState, SubdirCache};
+use file_browser::{
+    render_dir_tree, render_flat_file_list, FileEntry, RevealState, SubdirCache, TreeRenderState,
+};
 use git_diff::{render_git_diff, GitStageAction};
 use input::{key_to_pty_bytes, mouse_event_bytes};
 use labels::LabelRegistry;
@@ -68,6 +70,33 @@ use settings::AppSettings;
 use watcher::WatchState;
 use worker_manager::WorkerManager;
 use workspace_ui::{OpenFolderDialog, WorkspaceDialog, WorkspaceEditDialog};
+
+fn registered_shortcut_chord(
+    registry: &ShortcutRegistry,
+    action: AppAction,
+) -> Option<(egui::Modifiers, egui::Key)> {
+    registry.find_shortcut(action).map(|shortcut| {
+        (
+            egui::Modifiers {
+                alt: shortcut.alt,
+                ctrl: shortcut.ctrl,
+                shift: shortcut.shift,
+                mac_cmd: false,
+                command: false,
+            },
+            shortcut.key,
+        )
+    })
+}
+
+fn consume_registered_shortcut(
+    input: &mut egui::InputState,
+    registry: &ShortcutRegistry,
+    action: AppAction,
+) -> bool {
+    registered_shortcut_chord(registry, action)
+        .is_some_and(|(modifiers, key)| input.consume_key(modifiers, key))
+}
 
 #[derive(Clone, Copy, Default)]
 enum CloseAllTarget {
@@ -100,6 +129,7 @@ pub struct App {
     workspace_search_query: String,
 
     note_store: NoteStore,
+    note_autosave: note_save_worker::NoteAutosaveState,
     label_registry: LabelRegistry,
     notes_panel_ratio: f32,
     notes_panel_collapsed: bool,
@@ -128,6 +158,8 @@ pub struct App {
     closed_sessions_cache: Option<closed_sessions::ClosedSessionManifest>,
     shortcut_registry: ShortcutRegistry,
     settings: AppSettings,
+    /// Theme whose egui visuals are currently installed. `None` until the first apply.
+    applied_theme: Option<theme::ThemeId>,
 
     // Per-frame terminal geometry for mouse coordinate conversion
     active_term_geo: Option<TerminalGeometry>,
@@ -172,9 +204,8 @@ pub struct App {
     current_window_id: Option<WindowId>,
 
     // ── Per-frame UI caches ───────────────────────────────────────────────
-    /// Cached cell dimensions for the central panel font measurement.
-    /// Invalidated when font_size changes.
-    cached_cell_size: Option<(f32, f32, f32)>,
+    /// Cached terminal dimensions keyed by `(font_size, pixels_per_point)`.
+    cached_cell_size: Option<(f32, f32, f32, f32)>,
     /// Cache of `fs::read_dir` results for expanded subdirectories in the
     /// file browser, keyed by absolute path. Without this the dir tree
     /// re-reads disk on every frame for every expanded node.
@@ -200,7 +231,7 @@ pub struct App {
     // Text content search for file editors, notes, diffs (Ctrl+F)
     text_search: crate::search::TextSearchState,
 
-    // Global search across all sessions (Ctrl+Shift+T)
+    // Global search across all sessions
     show_global_search: bool,
     global_search_query: String,
     global_search_debouncer: crate::app::ui::debounce::Debouncer,
@@ -332,6 +363,8 @@ pub struct App {
 
     // Set once when restart_app() is attempted — prevents retrying every frame
     restart_attempted: bool,
+    // Opt-in frame metrics; absent unless TS_PERF=1.
+    perf: Option<perf::PerfMonitor>,
 }
 
 impl eframe::App for App {
@@ -400,6 +433,7 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.flush_note_autosave();
         self.save_session();
         self.save_windows();
         for entry in &self.session_state.sessions {
@@ -409,7 +443,7 @@ impl eframe::App for App {
         }
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         theme::clear_contrast_cache();
 
         // ── Enforce minimum window size (decorations(false) means the OS won't) ──
@@ -1188,9 +1222,83 @@ impl eframe::App for App {
             self.workspace_store.save();
             self.save_windows();
         }
+
+        if let Some(perf) = &mut self.perf {
+            perf.record(ctx, frame, Instant::now());
+        }
     }
 }
+
 impl App {
+    fn apply_note_save_completion(&mut self, completion: note_save_worker::NoteSaveCompletion) {
+        match completion.result {
+            Ok(()) => {
+                self.note_store.mark_save_completed(
+                    completion.group,
+                    &completion.path,
+                    &completion.text,
+                );
+                self.note_autosave
+                    .mark_completed(completion.group, completion.generation);
+            }
+            Err(error) => {
+                log::error!("failed to save note {}: {error}", completion.path.display());
+            }
+        }
+    }
+
+    fn enqueue_ready_note_saves(&mut self, ready_saves: Vec<note_save_worker::ReadyNoteSave>) {
+        for ready in ready_saves {
+            if let Some(path) = self
+                .note_store
+                .save_path(ready.group, &self.workspace_store.workspaces)
+            {
+                if !self
+                    .workers
+                    .note_save_worker
+                    .enqueue(note_save_worker::NoteSaveRequest {
+                        group: ready.group,
+                        path,
+                        text: ready.text,
+                        generation: ready.generation,
+                    })
+                {
+                    log::error!("note save worker is unavailable");
+                }
+            } else {
+                self.note_autosave
+                    .mark_completed(ready.group, ready.generation);
+            }
+        }
+    }
+
+    fn process_note_autosave(&mut self) {
+        for completion in self.workers.note_save_worker.take_completions() {
+            self.apply_note_save_completion(completion);
+        }
+        let ready = self.note_autosave.take_ready();
+        self.enqueue_ready_note_saves(ready);
+    }
+
+    fn flush_note_autosave(&mut self) {
+        self.process_note_autosave();
+        let pending = self.note_autosave.take_all_pending();
+        self.enqueue_ready_note_saves(pending);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while self.note_autosave.has_unsaved_changes() && Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let Some(completion) = self.workers.note_save_worker.receive_completion(remaining)
+            else {
+                break;
+            };
+            self.apply_note_save_completion(completion);
+        }
+        if self.note_autosave.has_unsaved_changes() {
+            log::error!("timed out while flushing note autosave");
+        }
+    }
+
     pub(crate) fn vp_id(&self, base: &str) -> egui::Id {
         let id = egui::Id::new(base);
         match &self.current_window_id {
@@ -1408,7 +1516,7 @@ impl App {
         // tab strip.
         struct PanelSnap {
             is_git: bool,
-            git_status: String,
+            git_status: Arc<git_worker::GitStatusSnapshot>,
             git_unpushed: Vec<(String, String)>,
             git_refreshing: bool,
             merge_operation: git_worker::MergeOperation,
@@ -1435,7 +1543,7 @@ impl App {
                     };
                     PanelSnap {
                         is_git: d.is_git,
-                        git_status: d.git_status.clone(),
+                        git_status: Arc::clone(&d.git_status),
                         git_unpushed: d.git_unpushed.clone(),
                         git_refreshing: self.workers.git_worker.is_manual_git_inflight(cwd),
                         merge_operation: d.merge_operation.clone(),
@@ -1458,7 +1566,7 @@ impl App {
                     };
                     PanelSnap {
                         is_git: false,
-                        git_status: String::new(),
+                        git_status: Arc::new(git_worker::GitStatusSnapshot::default()),
                         git_unpushed: Vec::new(),
                         git_refreshing: self.workers.git_worker.is_manual_git_inflight(cwd),
                         merge_operation: git_worker::MergeOperation::None,
@@ -1482,7 +1590,7 @@ impl App {
                 };
                 PanelSnap {
                     is_git: false,
-                    git_status: String::new(),
+                    git_status: Arc::new(git_worker::GitStatusSnapshot::default()),
                     git_unpushed: Vec::new(),
                     git_refreshing: false,
                     merge_operation: git_worker::MergeOperation::None,
@@ -1531,12 +1639,17 @@ impl App {
         let mut git_merge_continue = false;
         let mut open_md_in_editor: Option<PathBuf> = None;
 
-        // Detect external note edits (throttled internally)
-        self.note_store
-            .check_external_changes(&self.workspace_store.workspaces);
+        self.process_note_autosave();
+
+        // Detect external note edits only when no local write can be overwritten.
+        if !self.note_autosave.has_unsaved_changes() {
+            self.note_store
+                .check_external_changes(&self.workspace_store.workspaces);
+        }
 
         // Snapshot current note so TextEdit can mutate it inside the closure
         let mut note_text = self.note_store.get(self.active_group).to_string();
+        let note_is_saving = self.note_autosave.is_saving(self.active_group);
         let mut pending_open_note: Option<Option<u64>> = None;
 
         // ── Right panel ──────────────────────────────────────────────────────
@@ -1587,126 +1700,31 @@ impl App {
                                             ui.set_min_height(theme::HEADER_H);
                                             ui.spacing_mut().item_spacing.x = 0.0;
 
-                                            {
-                                                let t = theme::active();
-                                                let is_active_tab =
-                                                    active_tab == RightTab::Directory;
-                                                let tab_hover_t =
-                                                    crate::app::ui::animation::animated_hover(
-                                                        ui.ctx(),
-                                                        self.vp_id("right_tab_hover").with(0usize),
-                                                        false,
-                                                    );
-                                                let tab_color = if is_active_tab {
-                                                    t.text
-                                                } else {
-                                                    theme::lerp_color(
-                                                        t.fg_muted,
-                                                        t.fg_secondary,
-                                                        tab_hover_t,
-                                                    )
-                                                };
-                                                let resp = ui.selectable_label(
-                                                    is_active_tab,
-                                                    egui::RichText::new("Directory")
-                                                        .size(theme::FONT_UI_MD)
-                                                        .color(tab_color),
-                                                );
-                                                // Update hover animation with actual hovered state
-                                                let _ =
-                                                    crate::app::ui::animation::animated_hover(
-                                                        ui.ctx(),
-                                                        self.vp_id("right_tab_hover").with(0usize),
-                                                        resp.hovered(),
-                                                    );
-                                                if resp.clicked() {
-                                                    new_tab = Some(RightTab::Directory);
-                                                }
-                                                if is_active_tab {
-                                                    let underline_rect =
-                                                        egui::Rect::from_min_size(
-                                                            egui::pos2(
-                                                                resp.rect.min.x + theme::SP_2,
-                                                                resp.rect.max.y - 2.0,
-                                                            ),
-                                                            egui::vec2(
-                                                                resp.rect.width()
-                                                                    - theme::SP_2 * 2.0,
-                                                                2.0,
-                                                            ),
-                                                        );
-                                                    ui.painter().rect_filled(
-                                                        underline_rect,
-                                                        egui::Rounding::same(1.0),
-                                                        t.accent,
-                                                    );
-                                                }
-                                                resp.on_hover_text("Ctrl+Shift+D");
+                                            let directory_response = crate::ui_kit::tab_item(
+                                                ui,
+                                                "Directory",
+                                                active_tab == RightTab::Directory,
+                                                None,
+                                            );
+                                            if directory_response.clicked() {
+                                                new_tab = Some(RightTab::Directory);
                                             }
+                                            directory_response.on_hover_text("Ctrl+Shift+D");
 
                                             if is_git {
-                                                let t = theme::active();
-                                                let is_active_tab =
-                                                    active_tab == RightTab::GitDiff;
-                                                let tab_hover_t =
-                                                    crate::app::ui::animation::animated_hover(
-                                                        ui.ctx(),
-                                                        self.vp_id("right_tab_hover").with(1usize),
-                                                        false,
-                                                    );
-                                                let tab_color = if is_active_tab {
-                                                    t.text
-                                                } else {
-                                                    theme::lerp_color(
-                                                        t.fg_muted,
-                                                        t.fg_secondary,
-                                                        tab_hover_t,
-                                                    )
-                                                };
-                                                let git_change_count = git_status
-                                                    .lines()
-                                                    .filter(|l| l.len() >= 3)
-                                                    .count();
-                                                let tab_label = if git_change_count > 0 {
-                                                    format!("Git Diff ({})", git_change_count)
-                                                } else {
-                                                    "Git Diff".to_string()
-                                                };
-                                                let resp = ui.selectable_label(
-                                                    is_active_tab,
-                                                    egui::RichText::new(&tab_label)
-                                                        .size(theme::FONT_UI_MD)
-                                                        .color(tab_color),
+                                                let git_change_count = git_status.change_count;
+                                                let badge = (git_change_count > 0)
+                                                    .then(|| git_change_count.to_string());
+                                                let git_response = crate::ui_kit::tab_item(
+                                                    ui,
+                                                    "Git",
+                                                    active_tab == RightTab::GitDiff,
+                                                    badge.as_deref(),
                                                 );
-                                                let _ =
-                                                    crate::app::ui::animation::animated_hover(
-                                                        ui.ctx(),
-                                                        self.vp_id("right_tab_hover").with(1usize),
-                                                        resp.hovered(),
-                                                    );
-                                                if resp.clicked() {
+                                                if git_response.clicked() {
                                                     new_tab = Some(RightTab::GitDiff);
                                                 }
-                                                if is_active_tab {
-                                                    let underline_rect =
-                                                        egui::Rect::from_min_size(
-                                                            egui::pos2(
-                                                                resp.rect.min.x + theme::SP_2,
-                                                                resp.rect.max.y - 2.0,
-                                                            ),
-                                                            egui::vec2(
-                                                                resp.rect.width()
-                                                                    - theme::SP_2 * 2.0,
-                                                                2.0,
-                                                            ),
-                                                        );
-                                                    ui.painter().rect_filled(
-                                                        underline_rect,
-                                                        egui::Rounding::same(1.0),
-                                                        t.accent,
-                                                    );
-                                                }
-                                                resp.on_hover_text("Ctrl+Shift+G");
+                                                git_response.on_hover_text("Ctrl+Shift+G");
                                             }
 
                                             if !md_tabs.is_empty() {
@@ -1729,12 +1747,12 @@ impl App {
                                                 };
 
                                                 if md_count == 1 {
-                                                    // Single MD file: simple tab with ×
+                                                    // Single Markdown file: simple tab with close button
                                                     let path = &md_tabs[0];
                                                     let resp = ui.selectable_label(
                                                         is_any_md_active,
                                                         egui::RichText::new(&active_md_name)
-                                                            .size(theme::FONT_UI_MD)
+                                                            .size(theme::FONT_SM)
                                                             .color(tab_color),
                                                     );
                                                     let _ = crate::app::ui::animation::animated_hover(
@@ -1752,9 +1770,11 @@ impl App {
                                                     }
                                                     ui.add_space(theme::SP_1);
                                                     if ui.add(
-                                                        egui::Button::new(
-                                                            egui::RichText::new("×").size(theme::FONT_UI_MD).color(t.overlay1),
-                                                        ).frame(false).min_size(egui::vec2(theme::HEADER_H, theme::HEADER_H)),
+                                                        egui::Button::new(crate::ui_kit::icon(
+                                                            crate::ui_kit::icon::X,
+                                                            theme::FONT_SM,
+                                                            t.overlay1,
+                                                        )).frame(false).min_size(egui::vec2(theme::HEADER_H, theme::HEADER_H)),
                                                     ).on_hover_text("Close tab (Ctrl+Shift+W)").clicked() {
                                                         close_tab = Some(path.clone());
                                                     }
@@ -1766,7 +1786,7 @@ impl App {
                                                     let resp = ui.selectable_label(
                                                         is_any_md_active || is_popup_open,
                                                         egui::RichText::new(&label)
-                                                            .size(theme::FONT_UI_MD)
+                                                            .size(theme::FONT_SM)
                                                             .color(if is_popup_open { t.text } else { tab_color }),
                                                     );
                                                     let _ = crate::app::ui::animation::animated_hover(
@@ -1783,11 +1803,15 @@ impl App {
                                                         ui.painter().rect_filled(underline_rect, egui::Rounding::same(1.0), t.accent);
                                                     }
                                                     // Chevron
-                                                    ui.label(
-                                                        egui::RichText::new(if is_popup_open { "▴" } else { "▾" })
-                                                            .size(theme::FONT_UI_XS)
-                                                            .color(t.overlay1),
-                                                    );
+                                                    ui.label(crate::ui_kit::icon(
+                                                        if is_popup_open {
+                                                            crate::ui_kit::icon::CHEVRON_UP
+                                                        } else {
+                                                            crate::ui_kit::icon::CHEVRON_DOWN
+                                                        },
+                                                        theme::FONT_XS,
+                                                        t.overlay1,
+                                                    ));
 
                                                     if is_popup_open {
                                                         let screen_h = ui.ctx().screen_rect().height();
@@ -1808,16 +1832,18 @@ impl App {
                                                                         ui.horizontal(|ui| {
                                                                             let item_resp = ui.selectable_label(
                                                                                 is_active,
-                                                                                egui::RichText::new(&name).size(theme::FONT_UI_SM),
+                                                                                egui::RichText::new(&name).size(theme::FONT_XS),
                                                                             );
                                                                             if item_resp.clicked() {
                                                                                 new_tab = Some(RightTab::Markdown(path.clone()));
                                                                             }
                                                                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                                                                 if ui.add(
-                                                                                    egui::Button::new(
-                                                                                        egui::RichText::new("×").size(theme::FONT_UI_SM).color(t.overlay1),
-                                                                                    ).frame(false),
+                                                                                    egui::Button::new(crate::ui_kit::icon(
+                                                                                        crate::ui_kit::icon::X,
+                                                                                        theme::FONT_XS,
+                                                                                        t.overlay1,
+                                                                                    )).frame(false),
                                                                                 ).on_hover_text("Close").clicked() {
                                                                                     close_tab = Some(path.clone());
                                                                                 }
@@ -1829,7 +1855,7 @@ impl App {
                                                                 if ui.selectable_label(
                                                                     false,
                                                                     egui::RichText::new(format!("Close All ({})", md_count))
-                                                                        .size(theme::FONT_UI_SM)
+                                                                        .size(theme::FONT_XS)
                                                                         .color(t.error),
                                                                 ).clicked() {
                                                                     close_all_md = true;
@@ -1852,8 +1878,11 @@ impl App {
                                         ui.painter().text(
                                             fade.center(),
                                             egui::Align2::CENTER_CENTER,
-                                            "\u{2039}",
-                                            egui::FontId::proportional(theme::FONT_UI_SM),
+                                            crate::ui_kit::icon::ARROW_LEFT_RIGHT,
+                                            egui::FontId::new(
+                                                theme::FONT_XS,
+                                                egui::FontFamily::Name("icons".into()),
+                                            ),
                                             theme::active().text,
                                         );
                                     }
@@ -1866,8 +1895,11 @@ impl App {
                                         ui.painter().text(
                                             fade.center(),
                                             egui::Align2::CENTER_CENTER,
-                                            "\u{203a}",
-                                            egui::FontId::proportional(theme::FONT_UI_SM),
+                                            crate::ui_kit::icon::ARROW_LEFT_RIGHT,
+                                            egui::FontId::new(
+                                                theme::FONT_XS,
+                                                egui::FontFamily::Name("icons".into()),
+                                            ),
                                             theme::active().text,
                                         );
                                     }
@@ -1904,7 +1936,7 @@ impl App {
                                                         egui::Label::new(
                                                             egui::RichText::new(&ws.name)
                                                                 .strong()
-                                                                .size(theme::FONT_UI_SM)
+                                                                .size(theme::FONT_XS)
                                                                 .color(theme::ensure_readable(
                                                                     c, panel_bg,
                                                                 )),
@@ -1912,19 +1944,18 @@ impl App {
                                                         .truncate(),
                                                     )
                                                     .on_hover_text(&ws.name);
-                                                    ui.label(
-                                                        egui::RichText::new("›")
-                                                            .size(theme::FONT_UI_SM)
-                                                            .color(theme::active().overlay0),
-                                                    );
+                                                    ui.label(crate::ui_kit::icon(
+                                                        crate::ui_kit::icon::CHEVRON_RIGHT,
+                                                        theme::FONT_XS,
+                                                        theme::active().overlay0,
+                                                    ));
                                                 }
                                                 let path_max = (ui.available_width() - save_btn_reserve).max(20.0);
                                                 ui.allocate_ui(egui::vec2(path_max, ui.spacing().interact_size.y), |ui| {
                                                     ui.add(
                                                         egui::Label::new(
                                                             egui::RichText::new(theme::short_path(cwd))
-                                                                .monospace()
-                                                                .size(theme::FONT_UI_SM)
+                                                                .size(theme::FONT_XS)
                                                                 .color(theme::active().fg_path),
                                                         )
                                                         .truncate(),
@@ -1933,11 +1964,11 @@ impl App {
                                                 });
                                                 if !already_saved {
                                                     let save_btn = ui.add(
-                                                        egui::Button::new(
-                                                            egui::RichText::new("+")
-                                                                .size(theme::FONT_UI_SM)
-                                                                .color(theme::active().accent_strong),
-                                                        )
+                                                        egui::Button::new(crate::ui_kit::icon(
+                                                            crate::ui_kit::icon::PLUS,
+                                                            theme::FONT_XS,
+                                                            theme::active().accent_strong,
+                                                        ))
                                                         .rounding(theme::R_MD),
                                                     );
                                                     if save_btn.on_hover_text("Save as workspace").clicked() {
@@ -1952,7 +1983,7 @@ impl App {
                                                 let sb = crate::app::ui::search_bar::search_bar_persistent(
                                                     ui,
                                                     &mut self.dir_search_query,
-                                                    "\u{1f50d}",
+                                                    crate::ui_kit::icon::SEARCH,
                                                     "Search files\u{2026}",
                                                     dir_search_id,
                                                     focus,
@@ -2005,7 +2036,7 @@ impl App {
                                                         egui::RichText::new("Searching…")
                                                             .italics()
                                                             .color(theme::active().overlay0)
-                                                            .size(theme::FONT_UI_MD),
+                                                            .size(theme::FONT_SM),
                                                     );
                                                 } else {
                                                     let entries: Vec<FileEntry> = results
@@ -2039,15 +2070,21 @@ impl App {
                                                     path: self.reveal_file_path.take(),
                                                     highlight: self.reveal_highlight.take(),
                                                 };
-                                                render_dir_tree(
-                                                    ui,
-                                                    &dir_entries,
-                                                    &mut open_editor,
-                                                    &mut open_terminal_at,
-                                                    &mut cache,
-                                                    &mut self.drag_state,
-                                                    &mut reveal,
-                                                );
+                                                {
+                                                    let mut tree_state = TreeRenderState {
+                                                        open_editor: &mut open_editor,
+                                                        open_terminal_at: &mut open_terminal_at,
+                                                        drag_state: &mut self.drag_state,
+                                                        reveal: &mut reveal,
+                                                    };
+                                                    render_dir_tree(
+                                                        ui,
+                                                        &dir_entries,
+                                                        &git_status.modified,
+                                                        &mut cache,
+                                                        &mut tree_state,
+                                                    );
+                                                }
                                                 self.reveal_file_path = reveal.path;
                                                 self.reveal_highlight = reveal.highlight;
                                             }
@@ -2056,7 +2093,7 @@ impl App {
                                                 egui::RichText::new("(no active session)")
                                                     .italics()
                                                     .color(theme::active().overlay0)
-                                                    .size(theme::FONT_UI_MD),
+                                                    .size(theme::FONT_SM),
                                             );
                                         }
                                     }
@@ -2113,13 +2150,31 @@ impl App {
                                     }
                                     RightTab::Markdown(md_path) => {
                                         ui.horizontal(|ui| {
+                                            let mut open_in_pane_text =
+                                                egui::text::LayoutJob::default();
+                                            crate::ui_kit::icon(
+                                                crate::ui_kit::icon::MAXIMIZE,
+                                                theme::FONT_XS,
+                                                theme::active().text,
+                                            )
+                                            .append_to(
+                                                &mut open_in_pane_text,
+                                                ui.style(),
+                                                egui::FontSelection::Default,
+                                                egui::Align::Center,
+                                            );
+                                            egui::RichText::new(" Open in Pane")
+                                                .size(theme::FONT_XS)
+                                                .append_to(
+                                                    &mut open_in_pane_text,
+                                                    ui.style(),
+                                                    egui::FontSelection::Default,
+                                                    egui::Align::Center,
+                                                );
                                             if ui
                                                 .add(
-                                                    egui::Button::new(
-                                                        egui::RichText::new("\u{2B1C} Open in Pane")
-                                                            .size(theme::FONT_UI_SM),
-                                                    )
-                                                    .rounding(theme::R_SM),
+                                                    egui::Button::new(open_in_pane_text)
+                                                        .rounding(theme::R_SM),
                                                 )
                                                 .on_hover_text("Open this file in the main editor area")
                                                 .clicked()
@@ -2243,25 +2298,17 @@ impl App {
                             |ui| {
                                 let notes_label = ui.add(
                                     egui::Label::new(
-                                        egui::RichText::new("Notes")
+                                        egui::RichText::new("NOTES")
                                             .strong()
-                                            .size(theme::FONT_UI_MD),
+                                            .size(theme::FONT_SM),
                                     )
                                     .sense(egui::Sense::click()),
                                 );
-                                let auto_label = ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new("· autosaved")
-                                            .size(theme::FONT_UI_XS)
-                                            .color(theme::active().fg_muted),
-                                    )
-                                    .sense(egui::Sense::click()),
-                                );
-                                if notes_label.clicked() || auto_label.clicked() {
+                                if notes_label.clicked() {
                                     self.notes_panel_collapsed =
                                         !self.notes_panel_collapsed;
                                 }
-                                if notes_label.hovered() || auto_label.hovered() {
+                                if notes_label.hovered() {
                                     ui.ctx()
                                         .set_cursor_icon(egui::CursorIcon::PointingHand);
                                 }
@@ -2269,16 +2316,17 @@ impl App {
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
                                         let arrow = if self.notes_panel_collapsed {
-                                            "▶"
+                                            crate::ui_kit::icon::CHEVRON_RIGHT
                                         } else {
-                                            "▼"
+                                            crate::ui_kit::icon::CHEVRON_DOWN
                                         };
                                         if ui
                                             .add(
-                                                egui::Button::new(
-                                                    egui::RichText::new(arrow)
-                                                        .size(theme::FONT_UI_MD),
-                                                )
+                                                egui::Button::new(crate::ui_kit::icon(
+                                                    arrow,
+                                                    theme::FONT_SM,
+                                                    theme::active().text,
+                                                ))
                                                 .min_size(egui::vec2(
                                                     theme::HEADER_H,
                                                     theme::HEADER_H,
@@ -2293,10 +2341,11 @@ impl App {
                                         }
                                         if ui
                                             .add(
-                                                egui::Button::new(
-                                                    egui::RichText::new("\u{2B1C}")
-                                                        .size(theme::FONT_UI_MD),
-                                                )
+                                                egui::Button::new(crate::ui_kit::icon(
+                                                    crate::ui_kit::icon::MAXIMIZE,
+                                                    theme::FONT_SM,
+                                                    theme::active().text,
+                                                ))
                                                 .min_size(egui::vec2(
                                                     theme::HEADER_H,
                                                     theme::HEADER_H,
@@ -2308,6 +2357,16 @@ impl App {
                                         {
                                             pending_open_note = Some(self.active_group);
                                         }
+                                        ui.label(
+                                            egui::RichText::new(if note_is_saving {
+                                                "Saving…"
+                                            } else {
+                                                "Autosaved"
+                                            })
+                                            .family(egui::FontFamily::Proportional)
+                                            .size(theme::FONT_XS)
+                                            .color(theme::active().fg_muted),
+                                        );
                                     },
                                 );
                             },
@@ -2321,7 +2380,10 @@ impl App {
                                     ui.add(
                                         egui::TextEdit::multiline(&mut note_text)
                                             .id(self.vp_id("notes_textedit"))
-                                            .font(egui::TextStyle::Monospace)
+                                            .font(egui::FontId::new(
+                                                theme::FONT_SM,
+                                                egui::FontFamily::Proportional,
+                                            ))
                                             .desired_width(f32::INFINITY)
                                             .hint_text("Notes for this workspace…")
                                             .frame(false),
@@ -2332,12 +2394,15 @@ impl App {
                 });
         } // end if self.show_right_panel
 
-        // Persist note if it changed
+        // Queue note persistence if it changed. The worker performs disk I/O.
         {
             let group = self.active_group;
             if note_text != self.note_store.get(group) {
-                self.note_store
-                    .set(group, note_text, &self.workspace_store.workspaces);
+                let previous = self.note_store.get(group).to_owned();
+                self.note_autosave
+                    .changed(group, note_text.clone(), &previous);
+                self.note_store.update_cached(group, note_text);
+                ctx.request_repaint_after(note_save_worker::NOTE_SAVE_DELAY);
             }
         }
 
@@ -2577,14 +2642,24 @@ impl App {
             .frame(egui::Frame::none().inner_margin(egui::Margin::ZERO))
             .show(ctx, |ui| {
             let panel_rect = ui.max_rect();
-            let font_id    = FontId::monospace(self.settings.font_size);
+            let pixels_per_point = ctx.pixels_per_point();
             let (cw, ch) = match self.cached_cell_size {
-                Some((fs, w, h)) if fs == self.settings.font_size => (w, h),
-                _ => {
-                    let w = ui.fonts(|f| f.glyph_width(&font_id, 'M'));
-                    let h = ui.fonts(|f| f.row_height(&font_id));
-                    self.cached_cell_size = Some((self.settings.font_size, w, h));
+                Some((fs, ppp, w, h))
+                    if fs == self.settings.font_size && ppp == pixels_per_point =>
+                {
                     (w, h)
+                }
+                _ => {
+                    let metrics: crate::renderer::CellMetrics = ui.fonts(|fonts| {
+                        crate::renderer::terminal_cell_metrics(fonts, self.settings.font_size)
+                    });
+                    self.cached_cell_size = Some((
+                        self.settings.font_size,
+                        pixels_per_point,
+                        metrics.w,
+                        metrics.h,
+                    ));
+                    (metrics.w, metrics.h)
                 }
             };
             resize_cell_w  = cw;
@@ -2853,7 +2928,7 @@ impl App {
                             input_rect,
                             egui::TextEdit::singleline(&mut self.term_search.query)
                                 .desired_width(input_rect.width())
-                                .font(egui::FontId::monospace(theme::FONT_UI_MD))
+                                .font(egui::FontId::proportional(theme::FONT_SM))
                                 .hint_text("Search\u{2026}"),
                         );
                         if resp.changed() {
@@ -2882,12 +2957,12 @@ impl App {
                         );
                         let bar_id = ui.id().with("term_search_bar");
                         let prev_clicked = crate::ui_kit::icon_button(
-                            ui, bar_id.with("prev"), prev_rect, "\u{25B2}",
-                            theme::FONT_UI_XS, t.subtext0, crate::ui_kit::IconButtonStyle::Default,
+                            ui, bar_id.with("prev"), prev_rect, crate::ui_kit::icon::CHEVRON_UP,
+                            theme::FONT_XS, t.subtext0, crate::ui_kit::IconButtonStyle::Default,
                         ).clicked();
                         let next_clicked = crate::ui_kit::icon_button(
-                            ui, bar_id.with("next"), next_rect, "\u{25BC}",
-                            theme::FONT_UI_XS, t.subtext0, crate::ui_kit::IconButtonStyle::Default,
+                            ui, bar_id.with("next"), next_rect, crate::ui_kit::icon::CHEVRON_DOWN,
+                            theme::FONT_XS, t.subtext0, crate::ui_kit::IconButtonStyle::Default,
                         ).clicked();
 
                         let kb_prev = ui.input(|i| {
@@ -2932,7 +3007,7 @@ impl App {
                             egui::pos2(count_center_x, bar_rect.center().y),
                             egui::Align2::CENTER_CENTER,
                             &count_text,
-                            egui::FontId::monospace(theme::FONT_UI_SM),
+                            egui::FontId::proportional(theme::FONT_XS),
                             t.subtext0,
                         );
                     }
@@ -2963,30 +3038,86 @@ impl App {
             // Global shortcuts that work even when a modal/dialog is open
             {
                 let consumed = ctx.input_mut(|i| {
-                    let cs = egui::Modifiers { alt: false, ctrl: true, shift: true, mac_cmd: false, command: false };
-                    if i.consume_key(cs, egui::Key::Slash) || i.consume_key(cs, egui::Key::Questionmark) {
+                    if consume_registered_shortcut(
+                        i,
+                        &self.shortcut_registry,
+                        AppAction::ToggleShortcutHelp,
+                    ) || i.consume_key(
+                        egui::Modifiers {
+                            alt: false,
+                            ctrl: true,
+                            shift: true,
+                            mac_cmd: false,
+                            command: false,
+                        },
+                        egui::Key::Questionmark,
+                    ) {
                         Some(AppAction::ToggleShortcutHelp)
-                    } else if i.consume_key(cs, egui::Key::Comma) {
+                    } else if consume_registered_shortcut(
+                        i,
+                        &self.shortcut_registry,
+                        AppAction::OpenSettings,
+                    ) {
                         Some(AppAction::OpenSettings)
-                    } else if i.consume_key(cs, egui::Key::F) {
+                    } else if consume_registered_shortcut(
+                        i,
+                        &self.shortcut_registry,
+                        AppAction::FocusSessionSearch,
+                    ) {
                         Some(AppAction::FocusSessionSearch)
-                    } else if i.consume_key(cs, egui::Key::P) {
+                    } else if consume_registered_shortcut(
+                        i,
+                        &self.shortcut_registry,
+                        AppAction::CommandPalette,
+                    ) {
                         Some(AppAction::CommandPalette)
-                    } else if i.consume_key(cs, egui::Key::D) {
+                    } else if consume_registered_shortcut(
+                        i,
+                        &self.shortcut_registry,
+                        AppAction::RightTabDirectory,
+                    ) {
                         Some(AppAction::RightTabDirectory)
-                    } else if i.consume_key(cs, egui::Key::Space) {
+                    } else if consume_registered_shortcut(
+                        i,
+                        &self.shortcut_registry,
+                        AppAction::OpenQuickSwitcher,
+                    ) {
                         Some(AppAction::OpenQuickSwitcher)
-                    } else if i.consume_key(cs, egui::Key::N) {
+                    } else if consume_registered_shortcut(
+                        i,
+                        &self.shortcut_registry,
+                        AppAction::NewTerminalTab,
+                    ) {
                         Some(AppAction::NewTerminalTab)
-                    } else if i.consume_key(cs, egui::Key::Z) {
+                    } else if consume_registered_shortcut(
+                        i,
+                        &self.shortcut_registry,
+                        AppAction::ZoomPane,
+                    ) {
                         Some(AppAction::ZoomPane)
-                    } else if i.consume_key(cs, egui::Key::T) {
+                    } else if consume_registered_shortcut(
+                        i,
+                        &self.shortcut_registry,
+                        AppAction::SearchAllSessions,
+                    ) {
                         Some(AppAction::SearchAllSessions)
-                    } else if i.consume_key(cs, egui::Key::R) {
+                    } else if consume_registered_shortcut(
+                        i,
+                        &self.shortcut_registry,
+                        AppAction::ReopenClosedSession,
+                    ) {
                         Some(AppAction::ReopenClosedSession)
-                    } else if i.consume_key(egui::Modifiers { alt: false, ctrl: true, shift: false, mac_cmd: false, command: false }, egui::Key::P) {
+                    } else if consume_registered_shortcut(
+                        i,
+                        &self.shortcut_registry,
+                        AppAction::OpenFileFinder,
+                    ) {
                         Some(AppAction::OpenFileFinder)
-                    } else if i.consume_key(egui::Modifiers { alt: false, ctrl: true, shift: false, mac_cmd: false, command: false }, egui::Key::F) {
+                    } else if consume_registered_shortcut(
+                        i,
+                        &self.shortcut_registry,
+                        AppAction::SearchTerminal,
+                    ) {
                         Some(AppAction::SearchTerminal)
                     } else if (self.show_shortcut_help || self.term_search.active || self.text_search.active || self.show_global_search) && i.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
                         if self.show_global_search {
@@ -4411,11 +4542,15 @@ impl App {
                         PaneContent::NoteEditor(ref ne)
                             if *new_text != self.note_store.get(ne.workspace_id) =>
                         {
-                            self.note_store.set(
+                            let previous = self.note_store.get(ne.workspace_id).to_owned();
+                            self.note_autosave.changed(
                                 ne.workspace_id,
                                 new_text.clone(),
-                                &self.workspace_store.workspaces,
+                                &previous,
                             );
+                            self.note_store
+                                .update_cached(ne.workspace_id, new_text.clone());
+                            ctx.request_repaint_after(note_save_worker::NOTE_SAVE_DELAY);
                         }
                         _ => {}
                     }
@@ -4990,5 +5125,25 @@ impl App {
         self.render_stage_all_confirm(ctx);
         self.render_revert_confirm(ctx);
         self.render_delete_confirm(ctx);
+    }
+}
+
+#[cfg(test)]
+mod shortcut_tests {
+    use super::*;
+    use crate::keybindings::KeybindingsConfig;
+
+    #[test]
+    fn global_block_reopen_uses_registry_chord() {
+        let registry = ShortcutRegistry::from_config(KeybindingsConfig {
+            bindings: KeybindingsConfig::default_bindings(),
+        });
+
+        let (modifiers, key) = registered_shortcut_chord(&registry, AppAction::ReopenClosedSession)
+            .expect("reopen should have a registered shortcut");
+        assert_eq!(key, egui::Key::T);
+        assert!(modifiers.ctrl);
+        assert!(modifiers.shift);
+        assert!(!modifiers.alt);
     }
 }

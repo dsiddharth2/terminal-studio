@@ -1,13 +1,32 @@
 use super::super::super::pane::PaneContent;
 use super::super::super::title::effective_title;
 use super::super::super::{App, CloseAllTarget};
-use super::SessionListActions;
+use super::{section_header, SessionListActions};
 use crate::app::ui::search_bar::{search_bar, search_bar_persistent};
 use crate::pty::foreground::ForegroundProcess;
 use crate::theme;
 use crate::ui_kit;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RowStyle {
+    fill: Option<egui::Color32>,
+    dot: egui::Color32,
+    left_bar: bool,
+}
+
+fn session_row_style(
+    selected: bool,
+    ws_color: Option<egui::Color32>,
+    t: &theme::Theme,
+) -> RowStyle {
+    RowStyle {
+        fill: selected.then_some(t.accent_bg),
+        dot: ws_color.unwrap_or(egui::Color32::TRANSPARENT),
+        left_bar: false,
+    }
+}
 
 impl App {
     /// Render the sessions section: header with "+ New" menu, search bars,
@@ -33,7 +52,7 @@ impl App {
             let sb = search_bar_persistent(
                 ui,
                 &mut self.session_search_query,
-                "\u{1f50d}",
+                ui_kit::icon::SEARCH,
                 "Filter sessions\u{2026}",
                 search_id,
                 focus,
@@ -53,7 +72,7 @@ impl App {
             let sb = search_bar(
                 ui,
                 &mut self.global_search_query,
-                "\u{1f50d}",
+                ui_kit::icon::SEARCH,
                 "Search in all sessions\u{2026}",
                 search_id,
             );
@@ -88,7 +107,7 @@ impl App {
                 if !status.is_empty() {
                     ui.label(
                         egui::RichText::new(&status)
-                            .size(theme::FONT_UI_XS)
+                            .size(theme::FONT_XS)
                             .color(theme::active().subtext0),
                     );
                 }
@@ -124,57 +143,54 @@ impl App {
 
         // ── New custom label dialog ──────────────────────────────
         if let Some(target_pane_id) = self.show_new_label_dialog {
-            // Use egui::Id-keyed booleans to communicate button results out of the closure.
-            let create_id = egui::Id::new("new_label_dialog_create");
-            let cancel_id = egui::Id::new("new_label_dialog_cancel");
-
-            egui::Window::new("New Label")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Name:");
-                        ui.text_edit_singleline(&mut self.new_label_name);
-                    });
+            let mut created = false;
+            let mut cancelled = false;
+            let response = ui_kit::dialog(
+                ctx,
+                self.vp_id("new_label_dialog"),
+                ui_kit::DialogConfig {
+                    width: ui_kit::DialogWidth::Fixed(340.0),
+                    max_height: 280.0,
+                    ..Default::default()
+                },
+                |ui| {
+                    ui_kit::dialog_header(ui, "New Label");
+                    ui.label(ui_kit::label_secondary("Name"));
+                    ui.text_edit_singleline(&mut self.new_label_name);
                     ui.add_space(theme::SP_2);
-                    ui.label("Icon:");
+                    ui.label(ui_kit::label_secondary("Icon"));
                     ui.horizontal_wrapped(|ui| {
                         for (i, &icon) in crate::app::labels::CUSTOM_ICON_PALETTE.iter().enumerate()
                         {
                             let is_selected = self.new_label_icon_idx == i;
-                            let btn = ui.selectable_label(
+                            let button = ui.selectable_label(
                                 is_selected,
-                                egui::RichText::new(icon).size(theme::FONT_HEADING_2),
+                                egui::RichText::new(icon).size(theme::FONT_LG),
                             );
-                            if btn.clicked() {
+                            if button.clicked() {
                                 self.new_label_icon_idx = i;
                             }
                         }
                     });
-                    ui.add_space(theme::SP_3);
-                    ui.horizontal(|ui| {
-                        let can_create = !ui
-                            .data(|d| d.get_temp::<String>(create_id))
-                            .as_deref()
-                            .unwrap_or("")
-                            .is_empty();
-                        let _ = can_create;
-                        if ui.button("Create").clicked() && !self.new_label_name.trim().is_empty() {
-                            ui.data_mut(|d| d.insert_temp(create_id, true));
+                    let can_create = !self.new_label_name.trim().is_empty();
+                    let create_button = if can_create {
+                        ui_kit::DialogButton::Primary("Create")
+                    } else {
+                        ui_kit::DialogButton::DisabledPrimary("Create")
+                    };
+                    if let Some(index) = ui_kit::dialog_footer(
+                        ui,
+                        &[ui_kit::DialogButton::Secondary("Cancel"), create_button],
+                    ) {
+                        match index {
+                            0 => cancelled = true,
+                            1 if can_create => created = true,
+                            _ => {}
                         }
-                        if ui.button("Cancel").clicked() {
-                            ui.data_mut(|d| d.insert_temp(cancel_id, true));
-                        }
-                    });
-                });
-
-            let created = ctx
-                .data_mut(|d| d.remove_temp::<bool>(create_id))
-                .unwrap_or(false);
-            let cancelled = ctx
-                .data_mut(|d| d.remove_temp::<bool>(cancel_id))
-                .unwrap_or(false);
+                    }
+                },
+            );
+            cancelled |= response.dismissed;
 
             if created {
                 let name = self.new_label_name.trim().to_string();
@@ -219,64 +235,71 @@ impl App {
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
                 let session_count = self.pane_state.panes.len();
-                ui.label(
-                    egui::RichText::new(format!("Sessions ({})", session_count))
-                        .strong()
-                        .size(theme::FONT_UI_MD),
-                );
+                ui.label(section_header("SESSIONS", session_count));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let default_shell = self.configured_shell();
                     let shortcut_label = self
                         .shortcut_registry
                         .find_shortcut(crate::shortcuts::AppAction::NewTerminalTab)
                         .map(|s| s.label());
-                    ui.menu_button(
-                        egui::RichText::new("+ New \u{25be}").size(theme::FONT_UI_MD),
-                        |ui| {
-                            let label = if let Some(ref key) = shortcut_label {
-                                format!("{}    {}", default_shell.display_name(), key)
-                            } else {
-                                default_shell.display_name().to_string()
-                            };
-                            if ui.button(label).clicked() {
-                                actions.spawn_new_session = Some(default_shell.clone());
-                                ui.close_menu();
-                            }
-                            let others: Vec<_> =
-                                shells.iter().filter(|s| *s != &default_shell).collect();
-                            if !others.is_empty() {
-                                ui.separator();
-                                for shell in others {
-                                    if ui.button(shell.display_name()).clicked() {
-                                        actions.spawn_new_session = Some(shell.clone());
-                                        ui.close_menu();
+                    ui.scope(|ui| {
+                        let t = theme::active();
+                        ui.visuals_mut().widgets.inactive.weak_bg_fill = t.bg_raised;
+                        ui.visuals_mut().widgets.inactive.bg_stroke =
+                            egui::Stroke::new(theme::STROKE_THIN, t.border);
+                        ui.visuals_mut().widgets.hovered.weak_bg_fill = t.bg_raised;
+                        ui.visuals_mut().widgets.hovered.bg_stroke =
+                            egui::Stroke::new(theme::STROKE_THIN, t.border);
+                        ui.menu_button(
+                            egui::RichText::new("+ New")
+                                .size(theme::FONT_SM)
+                                .color(t.fg_strong),
+                            |ui| {
+                                let label = if let Some(ref key) = shortcut_label {
+                                    format!("{}    {}", default_shell.display_name(), key)
+                                } else {
+                                    default_shell.display_name().to_string()
+                                };
+                                if ui.button(label).clicked() {
+                                    actions.spawn_new_session = Some(default_shell.clone());
+                                    ui.close_menu();
+                                }
+                                let others: Vec<_> =
+                                    shells.iter().filter(|s| *s != &default_shell).collect();
+                                if !others.is_empty() {
+                                    ui.separator();
+                                    for shell in others {
+                                        if ui.button(shell.display_name()).clicked() {
+                                            actions.spawn_new_session = Some(shell.clone());
+                                            ui.close_menu();
+                                        }
                                     }
                                 }
-                            }
-                            ui.separator();
-                            if ui.button("Open Folder\u{2026}").clicked() {
-                                let ctx = ui.ctx().clone();
-                                std::thread::Builder::new()
-                                    .name("folder-picker".into())
-                                    .spawn(move || {
-                                        let result = rfd::FileDialog::new().pick_folder();
-                                        if let Some(path) = result {
-                                            ctx.data_mut(|d| {
-                                                d.insert_temp(
-                                                    egui::Id::new("pending_folder_pick"),
-                                                    path,
-                                                );
-                                            });
-                                            ctx.request_repaint();
-                                        }
-                                    })
-                                    .ok();
-                                ui.close_menu();
-                            }
-                        },
-                    )
-                    .response
-                    .on_hover_text("New terminal");
+                                ui.separator();
+                                if ui.button("Open Folder\u{2026}").clicked() {
+                                    let ctx = ui.ctx().clone();
+                                    std::thread::Builder::new()
+                                        .name("folder-picker".into())
+                                        .spawn(move || {
+                                            let result = rfd::FileDialog::new().pick_folder();
+                                            if let Some(path) = result {
+                                                ctx.data_mut(|d| {
+                                                    d.insert_temp(
+                                                        egui::Id::new("pending_folder_pick"),
+                                                        path,
+                                                    );
+                                                });
+                                                ctx.request_repaint();
+                                            }
+                                        })
+                                        .ok();
+                                    ui.close_menu();
+                                }
+                            },
+                        )
+                        .response
+                        .on_hover_text("New terminal");
+                    });
                     {
                         let (target, visible_count) =
                             if let Some(ws_filter) = self.session_workspace_filter {
@@ -298,12 +321,19 @@ impl App {
                             };
                         if visible_count > 1 {
                             let btn_label = if self.session_workspace_filter.is_some() {
-                                "Close Shown"
+                                "Close shown"
                             } else {
-                                "Close All"
+                                "Close all"
                             };
                             if ui
-                                .button(egui::RichText::new(btn_label).size(theme::FONT_UI_MD))
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new(btn_label)
+                                            .size(theme::FONT_XS)
+                                            .color(theme::active().fg_muted),
+                                    )
+                                    .frame(false),
+                                )
                                 .on_hover_text("Close all visible sessions")
                                 .clicked()
                             {
@@ -315,7 +345,14 @@ impl App {
                     }
                     if let Some(ref fp) = active_fg {
                         if ui
-                            .button(egui::RichText::new("Duplicate").size(theme::FONT_UI_MD))
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("Duplicate")
+                                        .size(theme::FONT_XS)
+                                        .color(theme::active().fg_muted),
+                                )
+                                .frame(false),
+                            )
                             .on_hover_text(format!("Duplicate: {} (Ctrl+Shift+K)", fp.name))
                             .clicked()
                         {
@@ -382,11 +419,15 @@ impl App {
         );
 
         let inner = rect.shrink2(egui::vec2(theme::SP_3, theme::SP_0));
-        let chevron = if is_open { "\u{25b4}" } else { "\u{25be}" };
+        let chevron = if is_open {
+            ui_kit::icon::CHEVRON_UP
+        } else {
+            ui_kit::icon::CHEVRON_DOWN
+        };
         let chevron_galley = ui.fonts(|f| {
             f.layout_no_wrap(
                 chevron.to_string(),
-                egui::FontId::proportional(theme::FONT_UI_XS),
+                egui::FontId::new(theme::FONT_XS, egui::FontFamily::Name("icons".into())),
                 t.fg_muted,
             )
         });
@@ -401,7 +442,7 @@ impl App {
         let text_galley = ui.fonts(|f| {
             f.layout_no_wrap(
                 selected_label,
-                egui::FontId::proportional(theme::FONT_UI_MD),
+                egui::FontId::proportional(theme::FONT_SM),
                 t.text,
             )
         });
@@ -481,11 +522,15 @@ impl App {
         );
 
         let inner = rect.shrink2(egui::vec2(theme::SP_3, theme::SP_0));
-        let chevron = if is_open { "\u{25b4}" } else { "\u{25be}" };
+        let chevron = if is_open {
+            ui_kit::icon::CHEVRON_UP
+        } else {
+            ui_kit::icon::CHEVRON_DOWN
+        };
         let chevron_galley = ui.fonts(|f| {
             f.layout_no_wrap(
                 chevron.to_string(),
-                egui::FontId::proportional(theme::FONT_UI_XS),
+                egui::FontId::new(theme::FONT_XS, egui::FontFamily::Name("icons".into())),
                 t.fg_muted,
             )
         });
@@ -500,7 +545,7 @@ impl App {
         let text_galley = ui.fonts(|f| {
             f.layout_no_wrap(
                 selected_label_text,
-                egui::FontId::proportional(theme::FONT_UI_MD),
+                egui::FontId::proportional(theme::FONT_SM),
                 t.text,
             )
         });
@@ -523,16 +568,12 @@ impl App {
                     if ui.selectable_label(is_all, "All Labels").clicked() {
                         self.session_label_filter = None;
                     }
-                    let popup_bg = t.base_rgb;
                     for ldef in self.label_registry.all() {
                         if !assigned.contains(&ldef.id) {
                             continue;
                         }
                         let is_selected = self.session_label_filter == Some(ldef.id);
-                        let color = theme::ensure_readable(
-                            [ldef.color().r(), ldef.color().g(), ldef.color().b()],
-                            popup_bg,
-                        );
+                        let color = if is_selected { t.fg_strong } else { t.fg };
                         let text = format!("{} {}", ldef.icon, ldef.name);
                         if ui
                             .selectable_label(is_selected, egui::RichText::new(text).color(color))
@@ -603,7 +644,7 @@ impl App {
                         }
                         ui.label(
                             egui::RichText::new(&m.session_title)
-                                .size(theme::FONT_UI_SM)
+                                .size(theme::FONT_XS)
                                 .strong()
                                 .color(t.blue),
                         );
@@ -652,7 +693,7 @@ impl App {
                             ),
                             egui::Align2::LEFT_CENTER,
                             &display,
-                            egui::FontId::monospace(theme::FONT_UI_SM),
+                            egui::FontId::proportional(theme::FONT_XS),
                             if selected { t.text } else { t.subtext0 },
                         );
 
@@ -699,9 +740,12 @@ impl App {
                 });
                 for &pane_idx in &sorted_indices {
                     let pane = &self.pane_state.panes[pane_idx];
-                    let (label, ws_color, dimmed): (String, Option<[u8; 3]>, bool) = match &pane
-                        .content
-                    {
+                    let (label, subtitle, ws_color, dimmed): (
+                        String,
+                        String,
+                        Option<[u8; 3]>,
+                        bool,
+                    ) = match &pane.content {
                         PaneContent::Terminal(sid) => {
                             if let Some(e) = self.session_state.find(*sid) {
                                 let (title, cwd) = {
@@ -724,11 +768,12 @@ impl App {
                                         Some(&e.shell),
                                         ws_name,
                                     ),
+                                    theme::short_path(&cwd),
                                     color,
                                     false,
                                 )
                             } else {
-                                ("(missing)".to_string(), None, true)
+                                ("(missing)".to_string(), String::new(), None, true)
                             }
                         }
                         PaneContent::DeferredTerminal {
@@ -751,7 +796,7 @@ impl App {
                             if text.is_empty() {
                                 text = "(restored)".to_string();
                             }
-                            (text, color, true)
+                            (text, theme::short_path(&cwd_path), color, true)
                         }
                         PaneContent::FileEditor(ed) => {
                             let text = ed
@@ -767,7 +812,7 @@ impl App {
                                     .find(|w| w.id == id)
                                     .map(|w| w.color)
                             });
-                            (text, color, false)
+                            (text, theme::short_path(&ed.path), color, false)
                         }
                         PaneContent::FileDiff(d) => {
                             let name = d
@@ -776,7 +821,7 @@ impl App {
                                 .and_then(|n| n.to_str())
                                 .map(|s| format!("\u{21c4} {}", s))
                                 .unwrap_or_else(|| format!("\u{21c4} {}", d.path.display()));
-                            (name, None, false)
+                            (name, theme::short_path(&d.path), None, false)
                         }
                         PaneContent::NoteEditor(ne) => {
                             let color = ne.workspace_id.and_then(|id| {
@@ -786,7 +831,7 @@ impl App {
                                     .find(|w| w.id == id)
                                     .map(|w| w.color)
                             });
-                            ("Notes".to_string(), color, false)
+                            ("Notes".to_string(), String::new(), color, false)
                         }
                         PaneContent::ConflictResolver(cr) => {
                             let name = cr
@@ -795,7 +840,7 @@ impl App {
                                 .and_then(|n| n.to_str())
                                 .map(|s| format!("\u{26a0} {}", s))
                                 .unwrap_or_else(|| "Conflicts".to_string());
-                            (name, None, false)
+                            (name, theme::short_path(&cr.path), None, false)
                         }
                     };
 
@@ -851,41 +896,33 @@ impl App {
 
                     let is_active = self.pane_state.active_pane_id == Some(pane.id);
 
-                    let (resp, painter) = ui.allocate_painter(
-                        egui::vec2(ui.available_width(), theme::SESSION_ROW_H),
-                        egui::Sense::click_and_drag(),
+                    let t = theme::active();
+                    let row_style = session_row_style(is_active, ws_color.map(theme::from_rgb), t);
+                    let resp = ui_kit::selectable_row(
+                        ui,
+                        row_style.fill.is_some(),
+                        theme::SESSION_ROW_H + theme::GIT_ROW_H,
+                        |_| {},
                     );
                     let row_rect = resp.rect;
-                    if resp.hovered() {
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                    }
-
-                    // Paint background — animated hover transition
                     let row_hovered = resp.hovered();
-                    let hover_id = egui::Id::new(("sess_row_hover", pane.id));
-                    let hover_t =
-                        crate::app::ui::animation::animated_hover(ui.ctx(), hover_id, row_hovered);
-                    let t = theme::active();
-                    let bg = if is_active {
-                        t.bg_row_active
-                    } else {
-                        theme::lerp_color(egui::Color32::TRANSPARENT, t.bg_row_hover, hover_t)
-                    };
-                    painter.rect_filled(row_rect, theme::R_MD, bg);
 
-                    // Full-height workspace color bar on the left edge
-                    if let Some(c) = ws_color {
-                        let bar_rect = egui::Rect::from_min_size(
-                            egui::pos2(row_rect.min.x, row_rect.min.y),
-                            egui::vec2(theme::WS_BORDER_W - 1.0, row_rect.height()),
+                    if row_style.dot != egui::Color32::TRANSPARENT {
+                        ui.painter().circle_filled(
+                            egui::pos2(row_rect.left() + theme::SP_3, row_rect.center().y),
+                            theme::SP_2,
+                            row_style.dot,
                         );
-                        let left_rounding = egui::Rounding {
-                            nw: theme::R_MD,
-                            sw: theme::R_MD,
-                            ne: 0.0,
-                            se: 0.0,
-                        };
-                        painter.rect_filled(bar_rect, left_rounding, theme::from_rgb(c));
+                    }
+                    if row_style.left_bar {
+                        ui.painter().rect_filled(
+                            egui::Rect::from_min_max(
+                                row_rect.min,
+                                egui::pos2(row_rect.left() + theme::STROKE_THIN, row_rect.bottom()),
+                            ),
+                            theme::R_NONE,
+                            row_style.dot,
+                        );
                     }
 
                     // Close button — hidden when row is idle, fades in on hover/active
@@ -905,7 +942,7 @@ impl App {
                             ui,
                             egui::Id::new(("pane_quit", pane.id)),
                             quit_rect,
-                            "\u{00d7}",
+                            ui_kit::icon::X,
                             theme::FONT_TERM,
                             close_color,
                             ui_kit::IconButtonStyle::Danger,
@@ -918,6 +955,7 @@ impl App {
                         Some((r, rect)) => (Some(*rect), r.clicked()),
                         None => (None, false),
                     };
+                    let painter = ui.painter();
 
                     let win_icon_w: f32 = if in_other_window {
                         theme::FONT_TERM
@@ -933,9 +971,12 @@ impl App {
                         painter.text(
                             egui::pos2(icon_x, row_rect.center().y),
                             egui::Align2::CENTER_CENTER,
-                            "\u{2197}",
-                            egui::FontId::proportional(theme::FONT_UI_SM),
-                            theme::active().blue,
+                            ui_kit::icon::MAXIMIZE,
+                            egui::FontId::new(
+                                theme::FONT_XS,
+                                egui::FontFamily::Name("icons".into()),
+                            ),
+                            t.accent,
                         );
                     }
 
@@ -964,21 +1005,13 @@ impl App {
                     let labels_right = row_rect.max.x - effective_btn_w - win_icon_w - theme::SP_1;
 
                     if !pane_labels.is_empty() {
-                        let row_bg_rgb = if is_active {
-                            t.surface0_rgb
-                        } else {
-                            t.base_rgb
-                        };
                         for (i, &lid) in pane_labels.iter().take(icons_to_show).enumerate() {
                             if let Some(ldef) = self.label_registry.get(lid) {
                                 let x = labels_right - labels_total_w
                                     + (i as f32) * (label_icon_size + label_gap)
                                     + label_gap;
                                 let icon_pos = egui::pos2(x, row_rect.center().y);
-                                let color = theme::ensure_readable(
-                                    [ldef.color().r(), ldef.color().g(), ldef.color().b()],
-                                    row_bg_rgb,
-                                );
+                                let color = if is_active { t.fg_strong } else { t.fg_muted };
                                 painter.text(
                                     icon_pos,
                                     egui::Align2::LEFT_CENTER,
@@ -1009,7 +1042,7 @@ impl App {
                                 egui::Align2::LEFT_CENTER,
                                 "\u{2026}",
                                 egui::FontId::proportional(label_icon_size),
-                                theme::active().subtext0,
+                                t.fg_muted,
                             );
                             let overflow_rect = egui::Rect::from_min_size(
                                 egui::pos2(x, row_rect.min.y),
@@ -1034,8 +1067,8 @@ impl App {
                         }
                     }
 
-                    // Title text: consistent left padding regardless of workspace bar
-                    let text_x = row_rect.min.x + theme::SP_4 + theme::WS_BORDER_W;
+                    // Title and subtitle keep a stable inset regardless of workspace color.
+                    let text_x = row_rect.min.x + theme::SP_6;
                     let clip_max = labels_right - labels_total_w;
                     let is_being_dragged = matches!(
                         &self.drag_state.payload,
@@ -1043,38 +1076,50 @@ impl App {
                             if matches!(&pane.content, PaneContent::Terminal(psid) if *psid == *sid)
                     );
                     let text_color = if dimmed {
-                        theme::active().overlay0
+                        t.fg_muted
                     } else if is_active {
-                        theme::active().text
+                        t.fg_strong
                     } else {
-                        theme::active().subtext0
+                        t.fg
                     };
                     let text_color = if is_being_dragged {
                         text_color.gamma_multiply(0.4)
                     } else {
                         text_color
                     };
-                    let available_w = (clip_max - text_x).max(0.0);
-                    let mut job = egui::text::LayoutJob::single_section(
-                        label.clone(),
-                        egui::TextFormat {
-                            font_id: egui::FontId::proportional(theme::FONT_UI_MD),
-                            color: text_color,
-                            ..Default::default()
-                        },
-                    );
-                    job.wrap = egui::text::TextWrapping {
-                        max_width: available_w,
-                        max_rows: 1,
-                        break_anywhere: true,
-                        overflow_character: Some('\u{2026}'),
-                    };
-                    let galley = ui.fonts(|f| f.layout_job(job));
-                    painter.galley(
-                        egui::pos2(text_x, row_rect.center().y - galley.rect.height() / 2.0),
-                        galley,
+                    let available_w = (clip_max - text_x).max(theme::SP_0);
+                    let title_galley = ui_kit::truncate_galley(
+                        painter,
+                        &label,
+                        egui::FontId::proportional(theme::FONT_MD),
                         text_color,
+                        available_w,
                     );
+                    if subtitle.is_empty() {
+                        painter.galley(
+                            egui::pos2(
+                                text_x,
+                                row_rect.center().y - title_galley.rect.height() / 2.0,
+                            ),
+                            title_galley,
+                            text_color,
+                        );
+                    } else {
+                        let subtitle_galley = ui_kit::truncate_galley(
+                            painter,
+                            &subtitle,
+                            egui::FontId::proportional(theme::FONT_XS),
+                            t.fg_muted,
+                            available_w,
+                        );
+                        let content_h = title_galley.rect.height()
+                            + theme::SP_1
+                            + subtitle_galley.rect.height();
+                        let title_y = row_rect.center().y - content_h / 2.0;
+                        let subtitle_y = title_y + title_galley.rect.height() + theme::SP_1;
+                        painter.galley(egui::pos2(text_x, title_y), title_galley, text_color);
+                        painter.galley(egui::pos2(text_x, subtitle_y), subtitle_galley, t.fg_muted);
+                    }
 
                     let resp = if in_other_window {
                         resp.on_hover_text(format!("{} (switch window)", label))
@@ -1114,23 +1159,23 @@ impl App {
                                     };
                                     ui.label(
                                         egui::RichText::new(header)
-                                            .size(theme::FONT_UI_XS)
+                                            .size(theme::FONT_XS)
                                             .strong()
-                                            .color(theme::active().subtext0),
+                                            .color(theme::active().fg_muted),
                                     );
                                     current_cat = Some(ldef.category.clone());
                                 }
                                 let is_set = pane_labels_snapshot.contains(&ldef.id);
                                 let check = if is_set { "\u{2713} " } else { "    " };
-                                let menu_bg = theme::active().base_rgb;
-                                let color = theme::ensure_readable(
-                                    [ldef.color().r(), ldef.color().g(), ldef.color().b()],
-                                    menu_bg,
-                                );
+                                let color = if is_set {
+                                    theme::active().fg_strong
+                                } else {
+                                    theme::active().fg
+                                };
                                 let label_text = format!("{}{} {}", check, ldef.icon, ldef.name);
                                 let btn = ui.button(
                                     egui::RichText::new(label_text)
-                                        .size(theme::FONT_UI_MD)
+                                        .size(theme::FONT_SM)
                                         .color(color),
                                 );
                                 if btn.clicked() {
@@ -1141,7 +1186,7 @@ impl App {
                             if ui
                                 .button(
                                     egui::RichText::new("+ New label\u{2026}")
-                                        .size(theme::FONT_UI_MD)
+                                        .size(theme::FONT_SM)
                                         .color(theme::active().accent),
                                 )
                                 .clicked()
@@ -1174,5 +1219,23 @@ impl App {
                     }
                 }
             });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::theme::{self, ThemeId};
+
+    #[test]
+    fn session_row_uses_shared_selection() {
+        let _guard = theme::test_support::lock_theme(ThemeId::CatppuccinMocha);
+        let t = theme::active();
+        let workspace_color = egui::Color32::from_rgb(0x12, 0x34, 0x56);
+
+        let style = super::session_row_style(true, Some(workspace_color), t);
+
+        assert_eq!(style.fill, Some(t.accent_bg));
+        assert_eq!(style.dot, workspace_color);
+        assert!(!style.left_bar);
     }
 }

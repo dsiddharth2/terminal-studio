@@ -2,7 +2,7 @@ use super::super::pane::PaneContent;
 use super::super::settings::InfoBarPosition;
 use super::super::App;
 use crate::theme;
-use crate::ui_kit::{icon_button, IconButtonStyle};
+use crate::ui_kit::{icon, icon_button, IconButtonStyle};
 
 const BTN_SIZE: f32 = 16.0;
 const TOGGLE_ICON_SIZE: f32 = 14.0;
@@ -22,20 +22,17 @@ impl App {
         let t = theme::active();
         let mut action = InfoBarAction::None;
 
-        let (session_title, ws_name, ws_color, git_branch) = self.info_bar_data(active_pane_id);
+        let (session_title, ws_name, _ws_color, git_branch) = self.info_bar_data(active_pane_id);
 
-        let bg = match ws_color {
-            Some(c) => theme::from_rgb(c),
-            None => t.surface0,
-        };
-        let fg = match ws_color {
-            Some(c) => theme::text_on(c),
-            None => t.subtext1,
-        };
-        let dim = fg.linear_multiply(0.6);
-        let extra_dim = fg.linear_multiply(0.4);
-
-        ui.painter().rect_filled(rect, 0.0, bg);
+        ui.painter().rect_filled(rect, theme::R_NONE, t.bg_panel);
+        ui.painter().rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(rect.min.x, rect.max.y - theme::STROKE_THIN),
+                rect.max,
+            ),
+            theme::R_NONE,
+            t.border,
+        );
 
         let pad_x = theme::SP_4;
         let text_rect = egui::Rect::from_min_max(
@@ -46,79 +43,79 @@ impl App {
             ),
         );
 
-        // Text segments: session · workspace  ⎇ branch
-        let title_font = egui::FontId::proportional(theme::FONT_UI_SM);
-        let branch_font = egui::FontId::proportional(theme::FONT_UI_XS);
+        // Breadcrumb: workspace  [git-branch icon] branch. Fall back to the
+        // pane title when a pane has no workspace.
+        let label = ws_name.as_ref().or(session_title.as_ref());
+        let branch = git_branch.as_deref().filter(|branch| !branch.is_empty());
+        if label.is_some() || branch.is_some() {
+            let text_font = egui::FontId::proportional(theme::FONT_SM);
+            let icon_font =
+                egui::FontId::new(theme::FONT_SM, egui::FontFamily::Name("icons".into()));
+            let mut job = egui::text::LayoutJob::default();
 
-        let mut segments: Vec<(std::sync::Arc<egui::Galley>, egui::Color32)> = Vec::new();
-
-        if let Some(ref title) = session_title {
-            segments.push((
-                ui.fonts(|f| f.layout_no_wrap(title.clone(), title_font.clone(), fg)),
-                fg,
-            ));
-        }
-        if let Some(ref ws) = ws_name {
-            if !segments.is_empty() {
-                segments.push((
-                    ui.fonts(|f| f.layout_no_wrap(" · ".into(), title_font.clone(), dim)),
-                    dim,
-                ));
+            if let Some(label) = label {
+                job.append(
+                    label,
+                    theme::SP_0,
+                    egui::TextFormat {
+                        font_id: text_font.clone(),
+                        color: t.fg,
+                        ..Default::default()
+                    },
+                );
             }
-            segments.push((
-                ui.fonts(|f| f.layout_no_wrap(ws.clone(), title_font.clone(), dim)),
-                dim,
-            ));
-        }
-        if let Some(ref branch) = git_branch {
-            if !branch.is_empty() {
-                segments.push((
-                    ui.fonts(|f| {
-                        f.layout_no_wrap(
-                            format!("  \u{2387} {branch}"),
-                            branch_font.clone(),
-                            extra_dim,
-                        )
-                    }),
-                    extra_dim,
-                ));
+            if let Some(branch) = branch {
+                if label.is_some() {
+                    job.append(
+                        "  ",
+                        theme::SP_0,
+                        egui::TextFormat {
+                            font_id: text_font.clone(),
+                            color: t.fg_muted,
+                            ..Default::default()
+                        },
+                    );
+                }
+                job.append(
+                    &icon::GIT_BRANCH.to_string(),
+                    theme::SP_0,
+                    egui::TextFormat {
+                        font_id: icon_font,
+                        color: t.fg_muted,
+                        ..Default::default()
+                    },
+                );
+                job.append(
+                    &format!(" {branch}"),
+                    theme::SP_0,
+                    egui::TextFormat {
+                        font_id: text_font,
+                        color: t.fg_muted,
+                        ..Default::default()
+                    },
+                );
             }
-        }
 
-        // Paint segments left-aligned, vertically centered
-        let total_w: f32 = segments.iter().map(|(g, _)| g.size().x).sum();
-        let avail_w = text_rect.width();
-        let mut x = text_rect.min.x;
-        let clipped = ui.painter().with_clip_rect(text_rect);
-        for (galley, color) in &segments {
-            if x - text_rect.min.x > avail_w {
-                break;
-            }
-            let y = text_rect.center().y - galley.size().y / 2.0;
-            clipped.galley(egui::pos2(x, y), galley.clone(), *color);
-            x += galley.size().x;
-        }
-        drop(clipped);
-
-        // Ellipsis if text overflows
-        if total_w > avail_w {
-            let ellipsis_rect = egui::Rect::from_min_size(
-                egui::pos2(text_rect.max.x - 16.0, text_rect.min.y),
-                egui::vec2(16.0, text_rect.height()),
-            );
-            ui.painter().rect_filled(ellipsis_rect, 0.0, bg);
-            ui.painter().text(
-                egui::pos2(text_rect.max.x - 2.0, text_rect.center().y),
-                egui::Align2::RIGHT_CENTER,
-                "…",
-                egui::FontId::proportional(theme::FONT_UI_XS),
-                dim,
+            job.wrap =
+                egui::text::TextWrapping::truncate_at_width(text_rect.width().max(theme::SP_0));
+            let galley = ui.fonts(|fonts| fonts.layout_job(job));
+            ui.painter().with_clip_rect(text_rect).galley(
+                egui::pos2(
+                    text_rect.min.x,
+                    text_rect.center().y - galley.size().y * 0.5,
+                ),
+                galley,
+                egui::Color32::PLACEHOLDER,
             );
         }
 
         // Action buttons on the right
         let is_top = self.settings.info_bar_position == InfoBarPosition::Top;
-        let toggle_icon = if is_top { "▼" } else { "▲" };
+        let toggle_icon = if is_top {
+            icon::CHEVRON_DOWN
+        } else {
+            icon::CHEVRON_UP
+        };
         let toggle_tooltip = if is_top {
             "Move to bottom"
         } else {
@@ -140,8 +137,8 @@ impl App {
             ui.id().with("info_bar_toggle"),
             toggle_rect,
             toggle_icon,
-            theme::ICON_SM,
-            fg,
+            theme::FONT_XS,
+            t.fg_muted,
             IconButtonStyle::Default,
         )
         .on_hover_text(toggle_tooltip);
@@ -158,9 +155,9 @@ impl App {
             ui,
             ui.id().with("info_bar_hide"),
             hide_rect,
-            "×",
-            theme::ICON_SM,
-            fg,
+            icon::X,
+            theme::FONT_XS,
+            t.fg_muted,
             IconButtonStyle::Default,
         )
         .on_hover_text("Hide info bar");
@@ -192,8 +189,8 @@ impl App {
             ui,
             ui.id().with("info_bar_show"),
             btn_rect,
-            "ℹ",
-            theme::ICON_SM,
+            icon::ROWS_2,
+            theme::FONT_XS,
             t.overlay0,
             IconButtonStyle::Default,
         )

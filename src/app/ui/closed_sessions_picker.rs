@@ -1,5 +1,6 @@
 use crate::app::closed_sessions::ClosedSessionManifest;
 use crate::theme;
+use crate::ui_kit;
 
 use super::super::App;
 
@@ -45,6 +46,7 @@ impl App {
 
         let mut restore_id: Option<u64> = None;
         let mut delete_id: Option<u64> = None;
+        let mut close_picker = false;
 
         egui::Area::new(self.vp_id("closed_sessions_dialog"))
             .fixed_pos(dialog_pos)
@@ -88,7 +90,7 @@ impl App {
                                 .id(search_id)
                                 .hint_text("Search closed sessions...")
                                 .desired_width(f32::INFINITY)
-                                .font(egui::FontId::proportional(theme::FONT_UI_MD))
+                                .font(egui::FontId::proportional(theme::FONT_SM))
                                 .text_color(t.text),
                         );
                         if !resp.has_focus() {
@@ -157,7 +159,7 @@ impl App {
                             ui.label(
                                 egui::RichText::new("No recently closed sessions")
                                     .color(t.subtext0)
-                                    .font(egui::FontId::proportional(theme::FONT_UI_MD)),
+                                    .font(egui::FontId::proportional(theme::FONT_SM)),
                             );
                         } else {
                             egui::ScrollArea::vertical()
@@ -196,7 +198,7 @@ impl App {
                                                                 egui::RichText::new(&record.title)
                                                                     .color(t.text)
                                                                     .font(egui::FontId::proportional(
-                                                                        theme::FONT_UI_MD,
+                                                                        theme::FONT_SM,
                                                                     )),
                                                             );
                                                             ui.with_layout(
@@ -213,7 +215,7 @@ impl App {
                                                                         .color(t.subtext0)
                                                                         .font(
                                                                             egui::FontId::proportional(
-                                                                                theme::FONT_UI_XS,
+                                                                                theme::FONT_XS,
                                                                             ),
                                                                         ),
                                                                     );
@@ -227,7 +229,7 @@ impl App {
                                                                             .color(t.accent)
                                                                             .font(
                                                                                 egui::FontId::proportional(
-                                                                                    theme::FONT_UI_XS,
+                                                                                    theme::FONT_XS,
                                                                                 ),
                                                                             ),
                                                                         );
@@ -253,7 +255,7 @@ impl App {
                                                                     .color(t.subtext0)
                                                                     .font(
                                                                         egui::FontId::proportional(
-                                                                            theme::FONT_UI_XS,
+                                                                            theme::FONT_XS,
                                                                         ),
                                                                     ),
                                                             );
@@ -268,7 +270,7 @@ impl App {
                                                                 .color(t.subtext0)
                                                                 .font(
                                                                     egui::FontId::proportional(
-                                                                        theme::FONT_UI_XS,
+                                                                        theme::FONT_XS,
                                                                     ),
                                                                 ),
                                                             );
@@ -302,9 +304,20 @@ impl App {
                                     }
                                 });
                         }
+                        if ui_kit::dialog_footer(
+                            ui,
+                            &[ui_kit::DialogButton::Secondary("Close")],
+                        )
+                        .is_some()
+                        {
+                            close_picker = true;
+                        }
                     });
             });
 
+        if close_picker {
+            self.close_closed_sessions_picker();
+        }
         if let Some(id) = restore_id {
             self.close_closed_sessions_picker();
             self.restore_closed_session(id);
